@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: CC0-1.0
+# SPDX-FileCopyrightText: none
+
+config-version: 2
+global:
+  branch-group: latest-kf6
+  include-dependencies: true
+
+  source-dir: /builder/src
+  build-dir: /builder/build
+  log-dir: /builder/log
+
+  install-dir: /usr/
+
+  cmake-options: >
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    -DKDE_INSTALL_USE_QT_SYS_PATHS=ON
+    -DBUILD_HTML_DOCS=OFF
+    -DBUILD_MAN_DOCS=OFF
+    -DBUILD_TESTING=OFF
+    -DBUILD_PYTHON_BINDINGS=OFF
+    -DWITH_PYTHON_VENDORING=ON
+    -DBUILD_QCH=OFF
+    -DCMAKE_INSTALL_LIBEXECDIR=libexec
+    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF
+
+  num-cores: "auto"
+  num-cores-low-mem: "auto"
+
+  install-login-session: false
+  stop-on-failure: true
+  directory-layout: flat
+  cmake-generator: Ninja
+  compile-commands-linking: false
+  compile-commands-export: false
+  generate-clion-project-config: false
+  generate-vscode-project-config: false
+  generate-qtcreator-project-config: false
+  check-self-updates: false
+
+  ignore-projects:
+  - kgamma
+  - kwin-x11
+  - wacomtablet
+  - packagekit-qt
+  - plymouth-kcm
+  - kaccounts-integration
+  - kde-vdg-extras
+  - oxygen
+  - oxygen-icons
+  - oxygen-sounds
+  - plasma-nano
+  - sddm-kcm
+  - snap-kcm
+
+include ${build-configs-dir}/kde6.yaml: ""
+
+override plasma-desktop:
+    cmake-options: -DBUILD_KCM_TOUCHPAD_X11=OFF -DBUILD_KCM_MOUSE_X11=OFF
+
+override plasma-integration:
+    cmake-options: -DDEFAULT_UNION_STYLE=ON -DBUILD_QT5=OFF
+
+override plasma-workspace:
+    cmake-options: -DWITH_X11_SESSION=OFF
+
+override plasma-login-manager:
+    cmake-options: -DPAM_OS_CONFIGURATION=fedora
+
+override konsole:
+    cmake-options: -DWITH_KAPSULE=ON
+
+override union:
+    cmake-options: -DBUILD_OUTPUT_QTWIDGETS=ON
+
+# TODO: REMOVE!
+override cxx-rust-cssparser:
+    branch: work/revert-f600ba40
