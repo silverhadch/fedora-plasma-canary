@@ -40,6 +40,7 @@ if [ "$FAILED" -eq 0 ]; then
 fi
 
 rm -rf /root
+rm -rf /builder
 log "Done. Logs at $ARTIFACTS_DIR"
 
 exit "$FAILED"

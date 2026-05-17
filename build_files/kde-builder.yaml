@@ -72,7 +72,3 @@ override konsole:
 
 override union:
     cmake-options: -DBUILD_OUTPUT_QTWIDGETS=ON
-
-# TODO: REMOVE!
-override cxx-rust-cssparser:
-    branch: work/revert-f600ba40
