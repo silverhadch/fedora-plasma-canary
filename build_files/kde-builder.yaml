@@ -55,6 +55,9 @@ global:
 
 include ${build-configs-dir}/kde6.yaml: ""
 
+override discover:
+    cmake-options: -DBUILD_RpmOstreeBackend=ON -DPACKAGEKIT_AUTOREMOVE=ON
+
 override plasma-desktop:
     cmake-options: -DBUILD_KCM_TOUCHPAD_X11=OFF -DBUILD_KCM_MOUSE_X11=OFF
 
