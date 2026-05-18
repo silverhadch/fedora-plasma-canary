@@ -34,6 +34,10 @@ if [ -d /builder/log ]; then
     cp -r /builder/log "$ARTIFACTS_DIR/kde-builder-logs"
 fi
 
+# Get rid of SDDM if it exists
+rm -f /etc/systemd/system/display-manager.service
+dnf5 remove -y sddm || true
+
 if [ "$FAILED" -eq 0 ]; then
     log "Enabling systemd units..."
     systemctl enable accounts-daemon.service  || error "Failed to enable accounts-daemon.service"
