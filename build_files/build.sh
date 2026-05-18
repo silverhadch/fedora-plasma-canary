@@ -11,7 +11,7 @@ mkdir -p /root/.config
 
 FAILED=0
 
-log() { echo -e "\n\033[1;34m==> $1\033[0m\n" | tee -a "$ARTIFACTS_DIR/build.log"; }
+log()   { echo -e "\n\033[1;34m==> $1\033[0m\n" | tee -a "$ARTIFACTS_DIR/build.log"; }
 error() { echo -e "\n\033[1;31mERROR: $1\033[0m\n" | tee -a "$ARTIFACTS_DIR/build.log" >&2; }
 
 log "Bootstrapping build dependencies..."
@@ -36,11 +36,20 @@ fi
 
 if [ "$FAILED" -eq 0 ]; then
     log "Enabling systemd units..."
-    systemctl enable podman.socket || error "Failed to enable podman.socket"
+    systemctl enable accounts-daemon.service  || error "Failed to enable accounts-daemon.service"
+    systemctl enable avahi-daemon.service     || error "Failed to enable avahi-daemon.service"
+    systemctl enable avahi-daemon.socket      || error "Failed to enable avahi-daemon.socket"
+    systemctl enable bluetooth.service        || error "Failed to enable bluetooth.service"
+    systemctl enable cups.service             || error "Failed to enable cups.service"
+    systemctl enable NetworkManager.service   || error "Failed to enable NetworkManager.service"
+    systemctl enable pcscd.socket             || error "Failed to enable pcscd.socket"
+    systemctl enable plasma-setup.service     || error "Failed to enable plasma-setup.service"
+    systemctl enable plasmalogin.service      || error "Failed to enable plasmalogin.service"
+    systemctl enable podman.socket            || error "Failed to enable podman.socket"
 fi
 
 rm -rf /root
 rm -rf /builder
-log "Done. Logs at $ARTIFACTS_DIR"
 
+log "Done. Logs at $ARTIFACTS_DIR"
 exit "$FAILED"

@@ -5,6 +5,30 @@ set -oue pipefail
 
 error() { echo -e "\n\033[1;31mERROR: $1\033[0m\n" >&2; }
 
+echo "==> Installing system layer (non-KDE plumbing)..."
+dnf5 install -y --skip-broken --skip-unavailable --allowerasing \
+    NetworkManager \
+    NetworkManager-wifi \
+    NetworkManager-bluetooth \
+    ModemManager \
+    avahi \
+    avahi-tools \
+    bluez \
+    cups \
+    pcsclite \
+    accounts-daemon \
+    polkit \
+    rtkit \
+    udisks2 \
+    upower \
+    xdg-desktop-portal \
+    xdg-user-dirs \
+    pipewire \
+    pipewire-pulseaudio \
+    pipewire-alsa \
+    wireplumber \
+    || error "Some system packages failed to install"
+
 echo "==> Installing build dependencies..."
 dnf5 install -y --skip-broken --skip-unavailable --allowerasing \
     sudo git ninja-build rsync openssh-clients ccache \
@@ -20,11 +44,10 @@ dnf5 group install development-tools -y || error "Some build deps failed to inst
 echo "==> Installing kde-builder..."
 git clone https://invent.kde.org/sdk/kde-builder.git /usr/share/kde-builder
 ln -sf /usr/share/kde-builder/kde-builder /usr/bin/kde-builder
-
 mkdir -p /usr/share/zsh/site-functions
-ln -sf /kde-builder/data/completions/zsh/_kde-builder \
+ln -sf /usr/share/kde-builder/data/completions/zsh/_kde-builder \
     /usr/share/zsh/site-functions/_kde-builder
-ln -sf /kde-builder/data/completions/zsh/_kde-builder_projects_and_groups \
+ln -sf /usr/share/kde-builder/data/completions/zsh/_kde-builder_projects_and_groups \
     /usr/share/zsh/site-functions/_kde-builder_projects_and_groups
 
 echo "==> Fetching and installing KDE distro dependencies..."

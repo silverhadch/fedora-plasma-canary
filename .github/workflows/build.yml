@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - main
+      - dev
     paths-ignore:
       - '**/README.md'
   workflow_dispatch:
@@ -34,10 +35,10 @@ jobs:
       matrix:
         variant:
           - name: dx
-            base_image: ghcr.io/ublue-os/kinoite-main:latest
+            base_image: ghcr.io/ublue-os/base-main:latest
             suffix: ""
           - name: nvidia
-            base_image: ghcr.io/ublue-os/kinoite-nvidia:latest
+            base_image: ghcr.io/ublue-os/base-nvidia:latest
             suffix: "-nvidia"
 
     permissions:
@@ -65,9 +66,15 @@ jobs:
       - name: Prepare environment
         run: |
           echo "IMAGE_REGISTRY=${IMAGE_REGISTRY,,}" >> ${GITHUB_ENV}
-          echo "IMAGE_NAME=${IMAGE_NAME,,}${{ matrix.variant.suffix }}" >> ${GITHUB_ENV}
           echo "BASE_IMAGE=${{ matrix.variant.base_image }}" >> ${GITHUB_ENV}
           echo "VARIANT_NAME=${{ matrix.variant.name }}" >> ${GITHUB_ENV}
+          if [ "${{ github.ref }}" = "refs/heads/dev" ]; then
+            echo "IMAGE_NAME=${IMAGE_NAME,,}${{ matrix.variant.suffix }}-dev" >> ${GITHUB_ENV}
+            echo "DEFAULT_TAG=dev" >> ${GITHUB_ENV}
+          else
+            echo "IMAGE_NAME=${IMAGE_NAME,,}${{ matrix.variant.suffix }}" >> ${GITHUB_ENV}
+            echo "DEFAULT_TAG=latest" >> ${GITHUB_ENV}
+          fi
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v5
@@ -110,16 +117,13 @@ jobs:
             io.artifacthub.package.keywords=${{ env.IMAGE_KEYWORDS }}
             io.artifacthub.package.license=Apache-2.0
             io.artifacthub.package.logo-url=${{ env.IMAGE_LOGO_URL }}
-            io.artifacthub.package.prerelease=false
+            io.artifacthub.package.prerelease=${{ github.ref == 'refs/heads/dev' }}
             containers.bootc=1
           sep-tags: " "
           sep-annotations: " "
 
       - name: Build Image
         id: build_image
-        # continue-on-error so the job proceeds to log extraction even on failure.
-        # The real exit code is captured inside the image at /usr/lib/kde-build-logs/exit-code
-        # and re-raised by the extraction step below.
         continue-on-error: true
         uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2
         with:
@@ -147,7 +151,6 @@ jobs:
             buildah rm \$CONTAINER
           "
 
-          # Re-raise the original build.sh exit code so the job fails correctly
           EXIT_CODE_FILE=/tmp/kde-build-logs/exit-code
           if [ -f "$EXIT_CODE_FILE" ]; then
             BUILD_EXIT=$(cat "$EXIT_CODE_FILE")
@@ -156,8 +159,6 @@ jobs:
               exit "$BUILD_EXIT"
             fi
           else
-            # No exit-code file means the image itself never committed (buildah-build
-            # failed before our RUN layer finished). Propagate the buildah failure.
             if [ "${{ steps.build_image.outcome }}" = "failure" ]; then
               echo "Build image step failed and no exit-code file was written."
               exit 1
@@ -166,7 +167,7 @@ jobs:
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -174,7 +175,7 @@ jobs:
 
       - name: Push To GHCR
         uses: redhat-actions/push-to-registry@5ed88d269cf581ea9ef6dd6806d01562096bee9c # v2
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
         id: push
         env:
           REGISTRY_USER: ${{ github.actor }}
@@ -188,10 +189,10 @@ jobs:
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
 
       - name: Sign container image
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
         run: |
           IMAGE_FULL="${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}"
           for tag in ${{ steps.metadata.outputs.tags }}; do

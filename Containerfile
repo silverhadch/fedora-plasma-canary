@@ -1,4 +1,4 @@
-ARG BASE_IMAGE="ghcr.io/ublue-os/kinoite-main:latest"
+ARG BASE_IMAGE="ghcr.io/ublue-os/base-main:latest"
 FROM scratch AS ctx
 COPY build_files /
 
