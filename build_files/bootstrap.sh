@@ -5,29 +5,30 @@ set -oue pipefail
 
 error() { echo -e "\n\033[1;31mERROR: $1\033[0m\n" >&2; }
 
-echo "==> Installing system layer (non-KDE plumbing)..."
+echo "==> Installing ccache..."
 dnf5 install -y --skip-broken --skip-unavailable --allowerasing \
-    NetworkManager \
-    NetworkManager-wifi \
-    NetworkManager-bluetooth \
-    ModemManager \
-    avahi \
-    avahi-tools \
-    bluez \
-    cups \
-    pcsclite \
-    accounts-daemon \
-    polkit \
-    rtkit \
-    udisks2 \
-    upower \
-    xdg-desktop-portal \
-    xdg-user-dirs \
-    pipewire \
+    ccache \
+    || error "ccache failed to install"
+
+echo "==> Configuring ccache..."
+export CCACHE_DIR=/ccache
+export CCACHE_MAXSIZE=10G
+ccache --set-config=cache_dir=/ccache
+ccache --set-config=max_size=10G
+ccache --set-config=compression=true
+ccache -z
+
+echo "==> Installing system runtime deps not covered by fedora.yaml..."
+dnf5 install -y --skip-broken --skip-unavailable --allowerasing \
+    wireplumber \
     pipewire-pulseaudio \
     pipewire-alsa \
-    wireplumber \
-    || error "Some system packages failed to install"
+    accounts-daemon \
+    avahi \
+    upower \
+    udisks2 \
+    pcscd \
+    || error "Some system runtime deps failed to install"
 
 echo "==> Installing build dependencies..."
 dnf5 install -y --skip-broken --skip-unavailable --allowerasing \

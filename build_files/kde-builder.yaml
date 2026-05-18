@@ -23,6 +23,8 @@ global:
     -DBUILD_QCH=OFF
     -DCMAKE_INSTALL_LIBEXECDIR=libexec
     -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
   num-cores: "auto"
   num-cores-low-mem: "auto"

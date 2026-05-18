@@ -48,6 +48,7 @@ if [ "$FAILED" -eq 0 ]; then
     systemctl enable podman.socket            || error "Failed to enable podman.socket"
 fi
 
+log "Cleaning up build artifacts..."
 rm -rf /root
 rm -rf /builder
 

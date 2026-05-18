@@ -88,6 +88,21 @@ jobs:
           mount-opts: compress-force=zstd:2
           loopback-free: '1'
 
+      - name: Set up ccache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/ccache
+          key: ccache-${{ matrix.variant.name }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ matrix.variant.name }}-${{ github.ref_name }}-
+            ccache-${{ matrix.variant.name }}-
+
+      - name: Inject ccache into build
+        run: |
+          mkdir -p /home/runner/ccache
+          # Make ccache dir world-writable so the container build can use it
+          chmod 777 /home/runner/ccache
+
       - name: Get current date
         id: date
         run: |
@@ -134,6 +149,7 @@ jobs:
           image: ${{ env.IMAGE_NAME }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
+          extra-args: --volume /home/runner/ccache:/ccache
           oci: false
 
       - name: Extract build logs and clean image
