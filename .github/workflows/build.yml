@@ -92,9 +92,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /home/runner/ccache
-          key: ccache-${{ github.run_id }}
+          key: ccache-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
-            ccache-
+            ccache-${{ github.ref_name }}-
 
       - name: Inject ccache into build
         run: |
@@ -150,6 +150,11 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           extra-args: --volume /home/runner/ccache:/ccache
           oci: false
+
+      - name: Push image to podman for rechunk
+        run: |
+          buildah push localhost/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }} \
+            containers-storage:localhost/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}
 
       - name: Run Rechunker
         id: rechunk
