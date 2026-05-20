@@ -6,7 +6,6 @@ import os
 import subprocess
 import logging
 import shutil
-import yaml
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

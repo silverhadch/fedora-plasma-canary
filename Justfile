@@ -36,7 +36,6 @@ build $target_image=image_name $tag=default_tag:
     podman build \
         "${LABELS[@]}" \
         --build-arg BASE_IMAGE={{ base_image }} \
-        --volume /home/runner/ccache:/ccache \
         --pull=newer \
         --tag "${target_image}:${tag}" \
         --file Containerfile \

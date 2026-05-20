@@ -10,14 +10,6 @@ dnf5 install -y --skip-broken --skip-unavailable --allowerasing \
     ccache \
     || error "ccache failed to install"
 
-echo "==> Configuring ccache..."
-export CCACHE_DIR=/ccache
-export CCACHE_MAXSIZE=10G
-ccache --set-config=cache_dir=/ccache
-ccache --set-config=max_size=10G
-ccache --set-config=compression=true
-ccache -z
-
 echo "==> Installing system runtime deps not covered by fedora.yaml..."
 dnf5 install -y --skip-broken --skip-unavailable --allowerasing \
     wireplumber \
@@ -40,7 +32,10 @@ dnf5 install -y --skip-broken --skip-unavailable --allowerasing \
     'dnf-command(repoquery)' \
     || error "Some build deps failed to install"
 
-dnf5 group install development-tools -y || error "Some build deps failed to install"
+dnf5 group install development-tools -y || error "development-tools failed to install"
+
+echo "==> Fetching and installing KDE distro dependencies..."
+python3 /ctx/install-kde-deps.py
 
 echo "==> Installing kde-builder..."
 git clone https://invent.kde.org/sdk/kde-builder.git /usr/share/kde-builder
@@ -50,9 +45,6 @@ ln -sf /usr/share/kde-builder/data/completions/zsh/_kde-builder \
     /usr/share/zsh/site-functions/_kde-builder
 ln -sf /usr/share/kde-builder/data/completions/zsh/_kde-builder_projects_and_groups \
     /usr/share/zsh/site-functions/_kde-builder_projects_and_groups
-
-echo "==> Fetching and installing KDE distro dependencies..."
-python3 /ctx/install-kde-deps.py
 
 echo "==> Installing dev tools..."
 dnf5 install -y --skip-broken --skip-unavailable --allowerasing \
