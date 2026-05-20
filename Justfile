@@ -52,14 +52,11 @@ ostree-rechunk $target_image=image_name $tag=default_tag:
         exit 1
     fi
 
-    RPM_OSTREE_CHUNKER_IMAGE="quay.io/fedora/fedora-bootc:latest"
-
     podman run --rm \
-        --pull=newer \
         --privileged \
         -v "/var/lib/containers:/var/lib/containers" \
         --entrypoint /usr/bin/rpm-ostree \
-        "${RPM_OSTREE_CHUNKER_IMAGE}" \
+        "localhost/${target_image}:${tag}" \
         compose build-chunked-oci \
         --max-layers 127 \
         --format-version=2 \
