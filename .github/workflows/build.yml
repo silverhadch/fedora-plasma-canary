@@ -79,7 +79,7 @@ jobs:
           loopback-free: '1'
 
       - name: Set up ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /home/runner/ccache
           key: ccache-${{ github.ref_name }}-${{ github.run_id }}
