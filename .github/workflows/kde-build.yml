@@ -1,22 +1,25 @@
 ---
 name: Build KDE Master
+
 on:
   schedule:
-    - cron: '00 02 * * *'  # 2:00am UTC every day
+    - cron: '00 02 * * *'
+  push:
+    branches:
+      - main
+      - dev
   workflow_dispatch:
 
 concurrency:
-  group: kde-build
+  group: kde-build-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
   build_kde:
     name: Build KDE from source
     runs-on: ubuntu-24.04
-
     permissions:
       contents: write
-
     steps:
       - uses: mathio/gha-cleanup@v1
         with:
@@ -26,13 +29,13 @@ jobs:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
-            tool-cache: true
-            android: true
-            dotnet: true
-            haskell: true
-            large-packages: true
-            docker-images: true
-            swap-storage: true
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v5
@@ -41,56 +44,55 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /home/runner/ccache
-          key: ccache-kde-build-${{ github.run_id }}
+          key: ccache-kde-build-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
+            ccache-kde-build-${{ github.ref_name }}-
             ccache-kde-build-
-            ccache-main-
-            ccache-dx-
-            ccache-nvidia-
-            ccache-dx-dev-
 
       - name: Inject ccache into build
         run: |
           mkdir -p /home/runner/ccache
           chmod 777 /home/runner/ccache
 
-      - name: Capture base image digest
+      - name: Capture base image tag
         run: |
           mkdir -p /tmp/kde-work
-          digest_main=$(skopeo inspect docker://ghcr.io/ublue-os/base-main:latest --format '{{.Digest}}')
-          digest_nvidia=$(skopeo inspect docker://ghcr.io/ublue-os/base-nvidia:latest --format '{{.Digest}}')
-          echo "BASE_IMAGE_DIGEST_MAIN=${digest_main}" >> ${GITHUB_ENV}
-          echo "BASE_IMAGE_DIGEST_NVIDIA=${digest_nvidia}" >> ${GITHUB_ENV}
-          printf "main=%s\nnvidia=%s\n" "${digest_main}" "${digest_nvidia}" > /tmp/kde-work/base-image-digest.txt
-          echo "base-main digest: ${digest_main}"
-          echo "base-nvidia digest: ${digest_nvidia}"
+
+          DATE=$(date +%Y%m%d)
+          TAG="rawhide.${DATE}.0"
+
+          echo "Verifying tag exists: ${TAG}"
+          skopeo inspect --no-creds docker://quay.io/fedora-ostree-desktops/base-atomic:${TAG} > /dev/null
+
+          echo "Using stable tag: ${TAG}"
+          echo "BASE_IMAGE_TAG=${TAG}" >> ${GITHUB_ENV}
+          printf "rawhide=quay.io/fedora-ostree-desktops/base-atomic:%s\n" "${TAG}" > /tmp/kde-work/base-image-digest.txt
 
       - name: Build KDE in container
         run: |
           mkdir -p /tmp/kde-work
-
           sudo podman run --rm \
             --privileged \
             --volume "$(pwd)/build_files:/ctx:ro" \
             --volume "/home/runner/ccache:/ccache" \
             --volume "/tmp/kde-work:/work" \
-            ghcr.io/ublue-os/base-main@${BASE_IMAGE_DIGEST_MAIN} \
+            quay.io/fedora-ostree-desktops/base-atomic:${BASE_IMAGE_TAG} \
             bash /ctx/kde-build-container.sh
 
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kde-build-logs
+          name: kde-build-logs-${{ github.ref_name }}
           path: /tmp/kde-work/logs/
           retention-days: 7
 
       - name: Upload KDE tar to kde-nightly release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: kde-nightly
-          name: KDE Master Nightly
-          body: "KDE git master build — updated daily. Do not use directly, consumed by the image build pipeline."
+          tag_name: kde-nightly-${{ github.ref_name }}
+          name: KDE Master Nightly (${{ github.ref_name }})
+          body: "KDE git master build for branch ${{ github.ref_name }} — updated daily. Do not use directly, consumed by the image build pipeline."
           prerelease: true
           files: |
             /tmp/kde-work/kde-master.tar.zst

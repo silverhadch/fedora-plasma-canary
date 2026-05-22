@@ -1,17 +1,26 @@
 ---
 name: Build container image
+
 on:
   pull_request:
     branches:
       - main
   schedule:
-    - cron: '05 10 * * *'  # 10:05am UTC everyday
+    - cron: '05 10 * * *'
   push:
     branches:
       - main
       - dev
     paths-ignore:
       - '**/README.md'
+  workflow_run:
+    workflows:
+      - "Build KDE Master"
+    types:
+      - completed
+    branches:
+      - main
+      - dev
   workflow_dispatch:
 
 env:
@@ -25,22 +34,31 @@ jobs:
   check_kde_tar:
     name: Check KDE nightly tar exists
     runs-on: ubuntu-24.04
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run' }}
     permissions:
       contents: read
+    outputs:
+      release_tag: ${{ steps.check.outputs.release_tag }}
     steps:
       - name: Check for kde-nightly release
+        id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if ! gh release view kde-nightly --repo ${{ github.repository }} > /dev/null 2>&1; then
-            echo "::error::kde-nightly release not found. Please run the 'Build KDE Master' workflow first to generate the tar."
+          RELEASE_TAG="kde-nightly-${{ github.ref_name }}"
+
+          if ! gh release view ${RELEASE_TAG} --repo ${{ github.repository }} > /dev/null 2>&1; then
+            echo "::error::${RELEASE_TAG} release not found. Please run the 'Build KDE Master' workflow first to generate the tar."
             exit 1
           fi
-          if ! gh release view kde-nightly --repo ${{ github.repository }} --json assets --jq '.assets[].name' | grep -q 'kde-master.tar.zst'; then
-            echo "::error::kde-master.tar.zst not found in kde-nightly release. Please run the 'Build KDE Master' workflow first."
+
+          if ! gh release view ${RELEASE_TAG} --repo ${{ github.repository }} --json assets --jq '.assets[].name' | grep -q 'kde-master.tar.zst'; then
+            echo "::error::kde-master.tar.zst not found in ${RELEASE_TAG} release. Please run the 'Build KDE Master' workflow first."
             exit 1
           fi
-          echo "kde-nightly release and tar found, proceeding with image build."
+
+          echo "release_tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
+          echo "${RELEASE_TAG} release and tar found, proceeding with image build."
 
   build_push:
     name: Build and push image
@@ -51,11 +69,8 @@ jobs:
       matrix:
         variant:
           - name: dx
-            base_image: ghcr.io/ublue-os/base-main:latest
+            base_image: quay.io/fedora-ostree-desktops/base-atomic:rawhide
             suffix: ""
-          - name: nvidia
-            base_image: ghcr.io/ublue-os/base-nvidia:latest
-            suffix: "-nvidia"
 
     permissions:
       contents: read
@@ -65,19 +80,19 @@ jobs:
     steps:
       - uses: mathio/gha-cleanup@v1
         with:
-         remove-browsers: true
-         verbose: true
+          remove-browsers: true
+          verbose: true
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
-            tool-cache: true
-            android: true
-            dotnet: true
-            haskell: true
-            large-packages: true
-            docker-images: true
-            swap-storage: true
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v5
@@ -102,43 +117,35 @@ jobs:
       - name: Download KDE tar
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.check_kde_tar.outputs.release_tag }}
         run: |
-          gh release download kde-nightly \
+          gh release download ${RELEASE_TAG} \
             --repo ${{ github.repository }} \
             --pattern 'kde-master.tar.zst' \
             --output build_files/kde-master.tar.zst
 
-          # Try to download the pinned base image digest
-          if gh release download kde-nightly \
+          if gh release download ${RELEASE_TAG} \
             --repo ${{ github.repository }} \
             --pattern 'base-image-digest.txt' \
             --output /tmp/base-image-digest.txt 2>/dev/null; then
-            DIGEST_MAIN=$(grep '^main=' /tmp/base-image-digest.txt | cut -d= -f2)
-            DIGEST_NVIDIA=$(grep '^nvidia=' /tmp/base-image-digest.txt | cut -d= -f2)
-            echo "Using pinned base-main digest: ${DIGEST_MAIN}"
-            echo "Using pinned base-nvidia digest: ${DIGEST_NVIDIA}"
-            echo "PINNED_BASE_IMAGE=ghcr.io/ublue-os/base-main@${DIGEST_MAIN}" >> ${GITHUB_ENV}
-            echo "PINNED_NVIDIA_BASE_IMAGE=ghcr.io/ublue-os/base-nvidia@${DIGEST_NVIDIA}" >> ${GITHUB_ENV}
+            PINNED=$(grep '^rawhide=' /tmp/base-image-digest.txt | cut -d= -f2)
+            echo "Using pinned base image: ${PINNED}"
+            echo "PINNED_BASE_IMAGE=${PINNED}" >> ${GITHUB_ENV}
           else
-            echo "::warning::base-image-digest.txt not found in kde-nightly release. Falling back to :latest — ABI compatibility not guaranteed."
-            echo "PINNED_BASE_IMAGE=ghcr.io/ublue-os/base-main:latest" >> ${GITHUB_ENV}
-            echo "PINNED_NVIDIA_BASE_IMAGE=ghcr.io/ublue-os/base-nvidia:latest" >> ${GITHUB_ENV}
+            echo "::warning::base-image-digest.txt not found in ${RELEASE_TAG} release. Falling back to :rawhide tag."
+            echo "PINNED_BASE_IMAGE=quay.io/fedora-ostree-desktops/base-atomic:rawhide" >> ${GITHUB_ENV}
           fi
 
       - name: Prepare environment
         run: |
           echo "IMAGE_REGISTRY=${IMAGE_REGISTRY,,}" >> ${GITHUB_ENV}
-          if [ "${{ matrix.variant.name }}" = "nvidia" ]; then
-            echo "BASE_IMAGE=${PINNED_NVIDIA_BASE_IMAGE}" >> ${GITHUB_ENV}
-          else
-            echo "BASE_IMAGE=${PINNED_BASE_IMAGE}" >> ${GITHUB_ENV}
-          fi
-          echo "VARIANT_NAME=${{ matrix.variant.name }}" >> ${GITHUB_ENV}
+          echo "BASE_IMAGE=${PINNED_BASE_IMAGE}" >> ${GITHUB_ENV}
+
           if [ "${{ github.ref }}" = "refs/heads/dev" ]; then
-            echo "IMAGE_NAME=${{ github.event.repository.name }}${{ matrix.variant.suffix }}-dev" >> ${GITHUB_ENV}
+            echo "IMAGE_NAME=${{ github.event.repository.name }}-dev" >> ${GITHUB_ENV}
             echo "DEFAULT_TAG=dev" >> ${GITHUB_ENV}
           else
-            echo "IMAGE_NAME=${{ github.event.repository.name }}${{ matrix.variant.suffix }}" >> ${GITHUB_ENV}
+            echo "IMAGE_NAME=${{ github.event.repository.name }}" >> ${GITHUB_ENV}
             echo "DEFAULT_TAG=latest" >> ${GITHUB_ENV}
           fi
 
@@ -180,7 +187,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kde-build-logs-${{ matrix.variant.name }}
+          name: kde-build-logs-${{ github.ref_name }}
           path: /tmp/kde-build-logs/
           retention-days: 7
 
@@ -218,6 +225,7 @@ jobs:
           ALIAS_TAGS: ${{ steps.gen-build-tags.outputs.alias_tags }}
         run: |
           set -euox pipefail
+
           for tag in ${ALIAS_TAGS}; do
             sudo podman push ${IMAGE_NAME}:${tag} ${IMAGE_REGISTRY}/${IMAGE_NAME}:${tag}
           done

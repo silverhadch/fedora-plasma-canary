@@ -1,18 +1,18 @@
-export image_name := env("IMAGE_NAME", "ublue-kde-dx")
-export repo_organization := env("REPO_ORGANIZATION", "silverhadch")
-export image_desc := env("IMAGE_DESC", "Ublue KDE DX Development Environment - Custom bootc image with KDE unstable builds")
-export image_keywords := env("IMAGE_KEYWORDS", "bootc,ublue,universal-blue,kde,development")
+export image_name := env("IMAGE_NAME", `basename $(git rev-parse --show-toplevel)`)
+export repo_organization := env("REPO_ORGANIZATION", `git remote get-url origin | sed 's|.*github.com/||' | cut -d/ -f1`)
+export image_desc := env("IMAGE_DESC", "Fedora Plasma Canary - bootc image with KDE git master and full development toolchain")
+export image_keywords := env("IMAGE_KEYWORDS", "bootc,fedora,kde,plasma,development,canary")
 export image_logo_url := env("IMAGE_LOGO_URL", "https://avatars.githubusercontent.com/u/120078124?s=200&v=4")
 export default_tag := env("DEFAULT_TAG", "latest")
-export base_image := env("BASE_IMAGE", "ghcr.io/ublue-os/base-main:latest")
+export base_image := env("BASE_IMAGE", "quay.io/fedora-ostree-desktops/base-atomic:rawhide")
 
 # Build the image
 build $target_image=image_name $tag=default_tag:
     #!/usr/bin/env bash
-
     set -euox pipefail
 
     LABELS=()
+
     if [[ -z "$(git status -s)" ]]; then
         GIT_SHA=$(git rev-parse --short HEAD)
         LABELS+=("--label" "io.artifacthub.package.readme-url=https://raw.githubusercontent.com/{{ repo_organization }}/{{ image_name }}/${GIT_SHA}/README.md")
@@ -44,7 +44,6 @@ build $target_image=image_name $tag=default_tag:
 # Rechunk the image with rpm-ostree
 ostree-rechunk $target_image=image_name $tag=default_tag:
     #!/usr/bin/env bash
-
     set -xeuo pipefail
 
     if [[ ! "${UID}" -eq "0" ]]; then
@@ -69,6 +68,7 @@ ostree-rechunk $target_image=image_name $tag=default_tag:
 generate-default-tag $tag=default_tag:
     #!/usr/bin/env bash
     set -eoux pipefail
+
     echo "${tag}"
 
 # Generate build tags
@@ -79,6 +79,7 @@ generate-build-tags $target_image=image_name $tag=default_tag:
 
     DATE=$(date +%Y%m%d)
     BUILD_TAGS=()
+
     if [[ -z "$(git status -s)" ]]; then
         GIT_SHA=$(git rev-parse --short HEAD)
         BUILD_TAGS+=("${tag}-${GIT_SHA}")

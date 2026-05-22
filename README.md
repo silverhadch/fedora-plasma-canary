@@ -1,6 +1,6 @@
-# ⚙️ ublue-kde-dx
+# 🐦 fedora-plasma-canary
 
-A custom bootc image with git master Plasma and KDE Gears, plus a full KDE development toolchain. Perfect for KDE developers who want to hack on Plasma itself.
+A Fedora bootc image with git master Plasma and KDE Gears, plus a full KDE development toolchain. Perfect for KDE developers who want to hack on Plasma itself.
 
 ## Features
 
@@ -11,35 +11,27 @@ A custom bootc image with git master Plasma and KDE Gears, plus a full KDE devel
 - Preinstalled `kde-builder` with shell completions
 - Enabled system services: `podman.socket`, `NetworkManager`, `bluetooth`, `cups`, and more
 
+## ⚠️ This is a canary image
+
+This image tracks KDE git master and Fedora rawhide. It **will** break. It is intended for KDE developers and contributors who want to run and hack on the latest Plasma, not for daily driving by regular users.
+
 ## Images
 
 | Image | Status |
 |---|---|
-| `ublue-kde-dx:latest` | ✅ Stable |
-| `ublue-kde-dx-nvidia:latest` | ✅ Stable |
-| `ublue-kde-dx-dev:dev` | ⚠️ WIP |
-| `ublue-kde-dx-dev-nvidia:dev` | ⚠️ WIP |
+| `fedora-plasma-canary:latest` | 🐦 Canary |
 
-> [!WARNING]
-> **`-dev` images are experimental and will be broken.**
-> They are built from the `dev` branch and may fail to boot or produce a broken desktop at any time. Do not use them.
+> [!NOTE]
+> The `dev` branch and any `-dev` tagged images are my personal testing ground for experimenting with the image itself before changes land on `main`. They are not releases and are not meant for anyone else to use.
 
 ## Rebase to This Image
 
-### Regular (AMD/Intel)
-
 ```bash
-sudo rpm-ostree rebase ostree-unverified-registry:ghcr.io/silverhadch/ublue-kde-dx:latest
-```
-
-### NVIDIA
-
-```bash
-sudo rpm-ostree rebase ostree-unverified-registry:ghcr.io/silverhadch/ublue-kde-dx-nvidia:latest
+sudo rpm-ostree rebase ostree-unverified-registry:ghcr.io/silverhadch/fedora-plasma-canary:latest
 ```
 
 Reboot afterwards to apply the image.
 
 ## Credits
 
-Customizations by @silverhadch. Based on Fedora and the [Universal Blue](https://universal-blue.org) project.
+Customizations by @silverhadch. Based on [Fedora](https://fedoraproject.org) and [KDE](https://kde.org).
