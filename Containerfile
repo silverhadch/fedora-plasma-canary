@@ -1,4 +1,5 @@
-ARG BASE_IMAGE="ghcr.io/ublue-os/base-main:latest"
+ARG BASE_IMAGE="quay.io/fedora-ostree-desktops/base-atomic:rawhide"
+
 FROM scratch AS ctx
 COPY build_files /
 
