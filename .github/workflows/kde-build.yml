@@ -109,7 +109,7 @@ jobs:
           path: /tmp/kde-work/
 
       - name: Upload KDE tar to kde-nightly release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: kde-nightly-${{ github.ref_name }}
           name: KDE Master Nightly (${{ github.ref_name }})
