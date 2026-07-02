@@ -5,6 +5,14 @@ set -oue pipefail
 
 error() { echo -e "\n\033[1;31mERROR: $1\033[0m\n" >&2; }
 
+# Block all 32-bit packages globally
+# Safely append the excludepkgs configuration to the main section
+sudo bash -c 'cat << EOF >> /etc/dnf/dnf.conf
+
+[main]
+excludepkgs=*.i686
+EOF'
+
 echo "==> Installing ccache..."
 dnf5 install -y --skip-broken --skip-unavailable --allowerasing \
     ccache \

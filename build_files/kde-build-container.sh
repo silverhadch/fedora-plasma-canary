@@ -10,6 +10,14 @@ mkdir -p "$DESTDIR" "$LOG_DIR"
 rm -rf /root
 mkdir -p /root/.config
 
+# Block all 32-bit packages globally
+# Safely append the excludepkgs configuration to the main section
+sudo bash -c 'cat << EOF >> /etc/dnf/dnf.conf
+
+[main]
+excludepkgs=*.i686
+EOF'
+
 FAILED=0
 
 log()   { echo -e "\n\033[1;34m==> $1\033[0m\n" | tee -a "$LOG_DIR/build.log"; }
