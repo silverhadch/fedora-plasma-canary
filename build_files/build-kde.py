@@ -10,39 +10,12 @@ import shutil
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-KDE_BUILDER_TARGETS = [
-    "appstream",
-    "ark",
-    "audiocd-kio",
-    "auto-chmod",
-    "dolphin",
-    "dolphin-plugins",
-    "ffmpegthumbs",
-    "kdeconnect-kde",
-    "kdegraphics-thumbnailers",
-    "kde-inotify-survey",
-    "kdenetwork-filesharing",
-    "kdialog",
-    "kimageformats",
-    "kio-admin",
-    "kio-fuse",
-    "kio-gdrive",
-    "plasma-setup",
-    "plasma-wayland-protocols",
-    "konlineaccounts",
-    "konsole",
-    "kpmcore",
-    "kunifiedpush",
-    "kup",
-    "kwalletmanager",
-    "package-compatibility-helper",
-    "partitionmanager",
-    "pulseaudio-qt",
-    "selenium-webdriver-at-spi",
-    "spectacle",
-    "workspace",
-    "xwaylandvideobridge",
-]
+def load_targets(path="/ctx/targets.txt"):
+    with open(path) as f:
+        return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+
+KDE_BUILDER_TARGETS = load_targets()
 
 
 def run_kde_builder(args):

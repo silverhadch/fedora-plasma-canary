@@ -93,6 +93,7 @@ jobs:
           path: |
             /tmp/kde-work/kde-master.tar.zst
             /tmp/kde-work/base-image-digest.txt
+            /tmp/kde-work/kde-runtime-deps.txt
           retention-days: 1
 
   release:
@@ -119,4 +120,5 @@ jobs:
           files: |
             /tmp/kde-work/kde-master.tar.zst
             /tmp/kde-work/base-image-digest.txt
+            /tmp/kde-work/kde-runtime-deps.txt
           token: ${{ secrets.GITHUB_TOKEN }}

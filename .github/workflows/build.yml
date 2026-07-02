@@ -125,6 +125,11 @@ jobs:
             --pattern 'kde-master.tar.zst' \
             --output build_files/kde-master.tar.zst
 
+          gh release download ${RELEASE_TAG} \
+            --repo ${{ github.repository }} \
+            --pattern 'kde-runtime-deps.txt' \
+            --output build_files/kde-runtime-deps.txt
+
           if gh release download ${RELEASE_TAG} \
             --repo ${{ github.repository }} \
             --pattern 'base-image-digest.txt' \

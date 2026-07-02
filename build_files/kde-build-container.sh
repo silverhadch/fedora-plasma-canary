@@ -45,7 +45,7 @@ git clone https://invent.kde.org/sdk/kde-builder.git /usr/share/kde-builder
 ln -sf /usr/share/kde-builder/kde-builder /usr/bin/kde-builder
 
 log "Fetching and installing KDE distro dependencies..."
-python3 /ctx/install-kde-deps.py 2>&1 | tee -a "$LOG_DIR/deps.log"
+python3 /ctx/install-kde-deps.py --compile 2>&1 | tee -a "$LOG_DIR/deps.log"
 
 log "Installing ninja hijack..."
 mv /usr/bin/ninja /usr/bin/ninja.orig
