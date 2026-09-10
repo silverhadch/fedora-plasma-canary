@@ -2,6 +2,4 @@ cosign.key
 _build_*
 output
 _build-*/**
-build_files/kde-master.tar.zst
-build_files/kde-runtime-deps.txt
-build_files/kde-excluded-pkgs.txt
+build_files/rpms/

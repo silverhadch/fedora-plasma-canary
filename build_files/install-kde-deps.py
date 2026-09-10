@@ -1,14 +1,30 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 # SPDX-FileCopyrightText: 2026 Hadi Chokr <hadichokr@icloud.com>
+"""Prepare the compile container and record what the build replaces.
+
+Runs once in kde-build-container.sh, before kde-builder, and does two things.
+
+It gets the throwaway compile container into shape: what fedora.yaml says KDE
+needs to build goes in, and no distro copy of anything being built is left to
+shadow the fresh one at link time. The container is discarded afterwards, so
+the blunt tools are fine here: an exclude drop-in and rpm -e --nodeps.
+
+And while dnf can still see the distro packages, it writes down what
+package-kde.py needs for the kde-canary metapackage: which Fedora packages the
+build replaces, expanded to whole source packages, what those provide, and
+what they require and recommend. Nothing from here ships; the image gets RPMs.
+"""
 
 import argparse
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
 import urllib.request
+
 import yaml
 
 logging.basicConfig(level=logging.INFO)
@@ -19,21 +35,26 @@ KDE_DEPS_YAML = "https://invent.kde.org/sysadmin/repo-metadata/-/raw/master/dist
 # dnf5 drop-in directory (overrides /etc/dnf/dnf.conf, last one wins per key)
 DNF_DROPIN = "/etc/dnf/libdnf5.conf.d/90-kde-selfbuilt.conf"
 
-# Exported for the final image build (step 2), same mechanism as kde-runtime-deps.txt
-EXCLUDES_EXPORT = "/work/kde-excluded-pkgs.txt"
-EXCLUDES_CTX = "/ctx/kde-excluded-pkgs.txt"
+# Read by package-kde.py
+META_DIR = "/work/meta"
+
+ARCHES = f"{platform.machine()},noarch"
 
 # Fedora's own Plasma configuration, which overrides upstream KDE defaults.
-# The image ships what KDE ships, so these stay out even though the distro
-# packages being replaced depend on them: plasma-workspace requires
-# kde-settings-plasma, so without this filter the harvest reinstates the whole
-# downstream config set.
+# The image ships what KDE ships, so kde-canary obsoletes these without
+# providing them, and a requirement on them is never re-stated. sddm is here
+# because Plasma Login Manager is built from source and replaces it.
 DOWNSTREAM_CONFIG = [re.compile(p) for p in (
     r"kde-settings.*",
     r"plasma-lookandfeel-fedora",
     r"plasma-welcome-fedora",
     r"fedora-chromium-config-kde",
+    r"sddm(-.*)?",
 )]
+
+# Source packages never expanded into the replaced set, whatever fedora.yaml
+# maps a module to. Obsoleting Qt would take the whole desktop with it.
+NEVER_EXPAND = re.compile(r"qt[56](-.*)?")
 
 
 def load_targets(path="/ctx/targets.txt"):
@@ -45,7 +66,7 @@ def load_targets(path="/ctx/targets.txt"):
 
 def load_ignored_projects(path="/ctx/kde-builder.yaml"):
     """Projects listed in ignore-projects are deliberately not part of the image,
-    so their distro packages must not be installed either (e.g. sddm, oxygen)."""
+    so their distro packages are obsoleted too (e.g. oxygen, kwin-x11)."""
     if not os.path.exists(path):
         return []
     with open(path) as f:
@@ -63,6 +84,7 @@ def run_kde_builder(args):
 
 
 def get_all_build_targets(targets):
+    """Every project kde-builder will build, in build order."""
     logger.info("Querying kde-builder for true build targets...")
     result = subprocess.run(
         ["kde-builder", "--include-dependencies", "--no-stop-on-failure", "--pretend"] + targets,
@@ -75,69 +97,13 @@ def get_all_build_targets(targets):
             part = line.split("Building ", 1)[1]
             module = part.split()[0].split("/")[-1]
             resolved.append(module)
-    return resolved
+    return list(dict.fromkeys(resolved))
 
 
 def fetch_deps_yaml(url):
     logger.info(f"Fetching metadata from {url}")
     with urllib.request.urlopen(url) as f:
         return yaml.full_load(f)
-
-
-def compute_excluded_packages(data, build_modules, ignored_modules):
-    """Fedora package names that must never come from the distro:
-    everything we build ourselves + everything on the ignore list."""
-    excluded = set()
-    for mod in set(build_modules) | set(ignored_modules):
-        # best effort: the module name itself usually matches the package name
-        excluded.add(mod)
-        entry = data.get(mod) or {}
-        excluded.update(entry.get("fedora_package") or [])
-    return excluded
-
-
-def harvest_distro_deps(excluded):
-    """Runtime dependencies the self-built tree no longer pulls in.
-
-    Building a KDE package from source severs every rpm dependency edge the
-    distro package had. bluez is the clearest case: it appears in no comps
-    group anywhere, and Kinoite only gets it because bluedevil requires it.
-    Build bluedevil yourself and bluetooth silently disappears from the image,
-    which is also why the systemctl enable in build.sh has nothing to enable.
-    fedora.yaml does not cover this, its rundeps are sparse and describe what
-    KDE needs to compile rather than what a running desktop needs.
-
-    Recommends matter as much as requires here. Fedora hangs a lot of the
-    desktop off weak dependencies: the Phonon VLC backend, tuned-ppd behind
-    powerdevil's power profiles, fprintd-pam, iio-sensor-proxy, the GTK tray
-    shims. A requires-only query leaves all of that out.
-
-    Must run before write_dnf_dropin(), because afterwards dnf cannot see
-    these packages to query them at all."""
-    names = sorted(excluded)
-    harvested = set()
-    for kind in ("--requires", "--recommends"):
-        logger.info(f"Querying rpm {kind.lstrip('-')} of {len(names)} replaced package(s)...")
-        process = subprocess.run(
-            ["dnf5", "repoquery", kind, "--resolve", "--qf", "%{name}"] + names,
-            capture_output=True,
-            text=True,
-        )
-        if process.returncode != 0:
-            logger.warning(f"repoquery {kind} failed ({process.returncode}): "
-                           f"{process.stderr.strip()}")
-            continue
-        harvested.update(line.strip() for line in process.stdout.splitlines() if line.strip())
-
-    harvested -= excluded
-    downstream = {p for p in harvested if any(b.fullmatch(p) for b in DOWNSTREAM_CONFIG)}
-    if downstream:
-        logger.info(f"Keeping upstream KDE defaults, dropping {len(downstream)} "
-                    f"downstream config package(s): {', '.join(sorted(downstream))}")
-        harvested -= downstream
-    logger.info(f"Harvested {len(harvested)} runtime dependency package(s) "
-                f"from replaced packages.")
-    return harvested
 
 
 def collect_deps(data, build_modules):
@@ -152,28 +118,83 @@ def collect_deps(data, build_modules):
     return builddeps, rundeps
 
 
+def fedora_names(data, modules):
+    """Fedora package names for kde-builder modules: fedora.yaml's mapping,
+    plus the module name itself, which usually matches."""
+    names = set()
+    for mod in modules:
+        names.add(mod)
+        entry = data.get(mod) or {}
+        names.update(entry.get("fedora_package") or [])
+    return names
+
+
+def repoquery(*args):
+    process = subprocess.run(
+        ["dnf5", "repoquery", f"--arch={ARCHES}", *args],
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(f"dnf5 repoquery {' '.join(args[:2])} failed "
+                           f"({process.returncode}): {process.stderr.strip()}")
+    return sorted({line.strip() for line in process.stdout.splitlines() if line.strip()})
+
+
+def source_map():
+    """Binary package name -> source package name, for everything in the repos."""
+    sources = {}
+    # A literal newline: dnf5 does not terminate --qf output on its own
+    for line in repoquery("--qf", "%{name} %{sourcerpm}\n"):
+        name, _, srpm = line.partition(" ")
+        if srpm and srpm != "(none)":
+            sources[name] = srpm.rsplit("-", 2)[0]
+    return sources
+
+
+def expand(names, sources):
+    """Every binary package built from the same source packages as names.
+
+    A project built from source replaces the whole Fedora source package, not
+    just the binary package fedora.yaml happens to name: plasma-workspace
+    comes with a dozen subpackages, and one left behind would conflict on
+    files with the build."""
+    srpms = {sources[n] for n in names if n in sources}
+    skipped = {s for s in srpms if NEVER_EXPAND.fullmatch(s)}
+    if skipped:
+        logger.warning(f"Not replacing source package(s) {', '.join(sorted(skipped))}: "
+                       f"fedora.yaml maps a built module to them, which is wrong.")
+    srpms -= skipped
+    return {n for n, s in sources.items() if s in srpms}
+
+
+def write_list(name, items):
+    path = os.path.join(META_DIR, name)
+    with open(path, "w") as f:
+        f.write("\n".join(items) + ("\n" if items else ""))
+    logger.info(f"Wrote {len(items)} line(s) to {path}")
+
+
 def write_dnf_dropin(excluded):
-    """Make every future dnf5 invocation (hotfix installs, group installs,
-    layering in the final image) refuse to pull the excluded packages back in.
+    """Make every later dnf5 invocation in this container (hotfix installs,
+    group installs) refuse to pull the replaced packages back in.
 
     NOTE: excludepkgs is replaced, not merged, and this drop-in overrides
-    /etc/dnf/dnf.conf — so the *.i686 exclude from bootstrap must be repeated
-    here or it would silently be re-enabled."""
+    /etc/dnf/dnf.conf, so the *.i686 exclude must be repeated here or it
+    would silently be re-enabled."""
     os.makedirs(os.path.dirname(DNF_DROPIN), exist_ok=True)
     value = ",".join(["*.i686"] + sorted(excluded))
     with open(DNF_DROPIN, "w") as f:
-        f.write("# Generated by install-kde-deps.py — packages built from source\n")
-        f.write("# or ignored via kde-builder ignore-projects. Do not install from repos.\n")
+        f.write("# Generated by install-kde-deps.py: packages the KDE build replaces.\n")
+        f.write("# Compile container only, the image gets kde-canary's Obsoletes instead.\n")
         f.write(f"[main]\nexcludepkgs={value}\n")
     logger.info(f"Wrote dnf exclude drop-in with {len(excluded)} packages to {DNF_DROPIN}")
 
 
 def remove_installed(excluded):
-    """Purge any excluded package that is already present (base image content,
-    or dragged in transitively before the drop-in existed). Uses rpm --nodeps:
-    dnf can no longer see these packages because of excludepkgs, and a dnf
-    remove would also rip out legitimate dependents like flatpak. The library
-    files are replaced by our own builds installing into /usr anyway."""
+    """Purge every replaced package that is present (the Kinoite base ships
+    most of them) so no stale distro lib shadows the fresh build at link time.
+    rpm --nodeps --noscripts, because this container is thrown away."""
     installed = []
     for pkg in sorted(excluded):
         rc = subprocess.run(
@@ -184,10 +205,10 @@ def remove_installed(excluded):
         if rc == 0:
             installed.append(pkg)
     if not installed:
-        logger.info("No excluded packages present on the system, nothing to remove.")
+        logger.info("No replaced packages present, nothing to remove.")
         return
-    logger.info(f"Removing {len(installed)} excluded package(s): {', '.join(installed)}")
-    subprocess.run(["rpm", "-e", "--nodeps"] + installed, check=True)
+    logger.info(f"Removing {len(installed)} replaced package(s): {', '.join(installed)}")
+    subprocess.run(["rpm", "-e", "--nodeps", "--noscripts"] + installed, check=True)
 
 
 def install(packages):
@@ -205,92 +226,50 @@ def install(packages):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--compile", action="store_true", help="Run in compilation mode to build targets and export runtime deps list")
-    args = parser.parse_args()
+    # Accepted for compatibility; compile mode is the only mode now.
+    parser.add_argument("--compile", action="store_true", help=argparse.SUPPRESS)
+    parser.parse_args()
 
-    targets = load_targets()
+    os.makedirs(META_DIR, exist_ok=True)
+    config_dir = "/root/.config"
+    os.makedirs(config_dir, exist_ok=True)
+    if os.path.exists("/ctx/kde-builder.yaml"):
+        shutil.copy("/ctx/kde-builder.yaml", f"{config_dir}/kde-builder.yaml")
 
-    if args.compile:
-        # Step 1: Run inside the transient compilation container (kde-build-container.sh)
-        config_dir = "/root/.config"
-        os.makedirs(config_dir, exist_ok=True)
-        if os.path.exists("/ctx/kde-builder.yaml"):
-            shutil.copy("/ctx/kde-builder.yaml", f"{config_dir}/kde-builder.yaml")
+    run_kde_builder(["--metadata-only"])
+    order = get_all_build_targets(load_targets())
+    ignored = load_ignored_projects()
 
-        run_kde_builder(["--metadata-only"])
-        all_targets = get_all_build_targets(targets)
-        ignored = load_ignored_projects()
+    data = fetch_deps_yaml(KDE_DEPS_YAML)
+    builddeps, rundeps = collect_deps(data, order)
 
-        data = fetch_deps_yaml(KDE_DEPS_YAML)
-        builddeps, rundeps = collect_deps(data, all_targets)
-        excluded = compute_excluded_packages(data, all_targets, ignored)
+    # Everything below queries the repos for the distro packages, so it has to
+    # happen before the drop-in hides them.
+    sources = source_map()
+    built = expand(fedora_names(data, order), sources)
+    ignored_pkgs = expand(fedora_names(data, ignored), sources) - built
+    replaced = built | ignored_pkgs
+    downstream = {n for n in sources if any(p.fullmatch(n) for p in DOWNSTREAM_CONFIG)}
+    logger.info(f"The build replaces {len(built)} Fedora package(s), and ignore-projects "
+                f"drops {len(ignored_pkgs)} more.")
 
-        # 1. Collect what the distro versions required, while dnf can still
-        #    see them. After the drop-in is written they are unqueryable.
-        harvested = harvest_distro_deps(excluded)
+    write_list("build-order.txt", order)
+    write_list("replaced.txt", sorted(replaced))
+    write_list("downstream.txt", sorted(downstream))
+    write_list("fedora-rundeps.txt", sorted(rundeps - replaced))
+    # repoquery with no package arguments lists the whole repo, hence the guards.
+    write_list("replaced-provides.txt",
+               repoquery("--provides", *sorted(replaced)) if replaced else [])
+    # Only what the built packages needed. The ignored ones are gone on
+    # purpose, so what they pulled in is not wanted either.
+    write_list("harvest-requires.txt",
+               repoquery("--requires", *sorted(built)) if built else [])
+    write_list("harvest-recommends.txt",
+               repoquery("--recommends", *sorted(built)) if built else [])
 
-        # 2. Never let dnf see the self-built/ignored packages again
-        write_dnf_dropin(excluded)
-
-        # 3. Install everything needed to compile, minus anything we provide ourselves
-        to_install = (builddeps | rundeps) - excluded
-        install(to_install)
-
-        # 4. Purge anything from the exclude list that is still on the system
-        #    (preinstalled in the base image or pulled in before the drop-in).
-        #    This is what prevents a stale distro lib (e.g. libappstream) from
-        #    shadowing the freshly built one at build time.
-        remove_installed(excluded)
-
-        # Export isolated runtime-only dependencies for the downstream final
-        # image, including the requires harvested from the replaced packages.
-        runtime_final = (rundeps | harvested) - excluded
-        os.makedirs(os.path.dirname(EXCLUDES_EXPORT), exist_ok=True)
-        with open("/work/kde-runtime-deps.txt", "w") as f:
-            f.write("\n".join(sorted(runtime_final)))
-        logger.info("Exported runtime dependencies list to /work/kde-runtime-deps.txt")
-
-        # Export the exclude list so the final image can apply the same policy
-        with open(EXCLUDES_EXPORT, "w") as f:
-            f.write("\n".join(sorted(excluded)))
-        logger.info(f"Exported package exclude list to {EXCLUDES_EXPORT}")
-
-    else:
-        # Step 2: Run inside the final image (build.sh)
-        # Apply the same excludes there: protects the extracted KDE tar from
-        # ever being overwritten by distro packages (dnf layering, hotfixes).
-        harvested = set()
-        if os.path.exists(EXCLUDES_CTX):
-            with open(EXCLUDES_CTX) as f:
-                excluded = {line.strip() for line in f if line.strip()}
-
-            # Harvest here as well as in compile mode, and before the drop-in
-            # is written. kde-excluded-pkgs.txt is all the harvest needs and
-            # build.yml already downloads it, so there is no reason to make
-            # this wait for a six hour KDE rebuild. Doing it only in compile
-            # mode is why libddcutil was missing: ddcutil arrives through
-            # fedora.yaml, but libddcutil is an rpm requires of powerdevil,
-            # and powerdevil is built from source and never installed.
-            harvested = harvest_distro_deps(excluded)
-
-            write_dnf_dropin(excluded)
-            remove_installed(excluded)
-        else:
-            excluded = set()
-            logger.warning(f"No exclude list at {EXCLUDES_CTX}, skipping dnf drop-in.")
-
-        runtime_deps = set()
-        deps_file = "/ctx/kde-runtime-deps.txt"
-        if os.path.exists(deps_file):
-            with open(deps_file) as f:
-                runtime_deps = {line.strip() for line in f if line.strip()}
-        else:
-            logger.error(f"Required dependency tracking file missing at {deps_file}")
-
-        to_install = (runtime_deps | harvested) - excluded
-        logger.info(f"Installing final image runtime requirements "
-                    f"({len(runtime_deps)} tracked, {len(harvested)} harvested)...")
-        install(to_install)
+    write_dnf_dropin(replaced)
+    install((builddeps | rundeps) - replaced)
+    remove_installed(replaced)
 
 
 if __name__ == "__main__":

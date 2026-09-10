@@ -31,8 +31,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check_kde_tar:
-    name: Check KDE nightly tar exists
+  check_kde_build:
+    name: Check KDE nightly RPMs exist
     runs-on: ubuntu-24.04
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run' }}
     permissions:
@@ -46,25 +46,35 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          RELEASE_TAG="kde-nightly-${{ github.ref_name }}"
+          set -euo pipefail
+          # Pull requests build against the RPMs of the branch they target.
+          RELEASE_TAG="kde-nightly-${{ github.base_ref || github.ref_name }}"
 
-          if ! gh release view ${RELEASE_TAG} --repo ${{ github.repository }} > /dev/null 2>&1; then
-            echo "::error::${RELEASE_TAG} release not found. Please run the 'Build KDE Master' workflow first to generate the tar."
+          if ! ASSETS=$(gh release view "${RELEASE_TAG}" --repo ${{ github.repository }} \
+                --json assets --jq '.assets[].name' 2>/dev/null); then
+            echo "::error::${RELEASE_TAG} release not found. Please run the 'Build KDE Master' workflow first."
             exit 1
           fi
 
-          if ! gh release view ${RELEASE_TAG} --repo ${{ github.repository }} --json assets --jq '.assets[].name' | grep -q 'kde-master.tar.zst'; then
-            echo "::error::kde-master.tar.zst not found in ${RELEASE_TAG} release. Please run the 'Build KDE Master' workflow first."
+          if ! grep -qx 'manifest.txt' <<<"${ASSETS}"; then
+            echo "::error::${RELEASE_TAG} has no manifest.txt, so it predates the RPM pipeline. Rerun 'Build KDE Master'."
             exit 1
+          fi
+
+          PUBLISHED=$(gh release view "${RELEASE_TAG}" --repo ${{ github.repository }} \
+                      --json publishedAt --jq '.publishedAt')
+          AGE_DAYS=$(( ( $(date +%s) - $(date -d "${PUBLISHED}" +%s) ) / 86400 ))
+          if [ "${AGE_DAYS}" -ge 2 ]; then
+            echo "::warning::The KDE RPMs are ${AGE_DAYS} days old: 'Build KDE Master' has not published since ${PUBLISHED}."
           fi
 
           echo "release_tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
-          echo "${RELEASE_TAG} release and tar found, proceeding with image build."
+          echo "${RELEASE_TAG} release and RPMs found, proceeding with image build."
 
   build_push:
     name: Build and push image
     runs-on: ubuntu-24.04
-    needs: check_kde_tar
+    needs: check_kde_build
     strategy:
       fail-fast: false
       matrix:
@@ -114,32 +124,29 @@ jobs:
           mount-opts: compress-force=zstd:2
           loopback-free: '1'
 
-      - name: Download KDE tar
+      - name: Download KDE master RPMs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.check_kde_tar.outputs.release_tag }}
+          RELEASE_TAG: ${{ needs.check_kde_build.outputs.release_tag }}
         run: |
-          gh release download ${RELEASE_TAG} \
-            --repo ${{ github.repository }} \
-            --pattern 'kde-master.tar.zst' \
-            --output build_files/kde-master.tar.zst
+          set -euo pipefail
+          RPM_DIR=build_files/rpms
+          mkdir -p "${RPM_DIR}"
 
           gh release download ${RELEASE_TAG} \
             --repo ${{ github.repository }} \
-            --pattern 'kde-runtime-deps.txt' \
-            --output build_files/kde-runtime-deps.txt
+            --pattern 'manifest.txt' \
+            --pattern 'kde-canary*.rpm' \
+            --dir "${RPM_DIR}"
 
-          # Optional until the first 'Build KDE Master' run that stages it.
-          # install-kde-deps.py degrades gracefully when the file is absent.
-          if gh release download ${RELEASE_TAG} \
-            --repo ${{ github.repository }} \
-            --pattern 'kde-excluded-pkgs.txt' \
-            --output build_files/kde-excluded-pkgs.txt 2>/dev/null; then
-            echo "Fetched exclude list ($(wc -l < build_files/kde-excluded-pkgs.txt) packages)."
-          else
-            echo "::warning::kde-excluded-pkgs.txt not present in ${RELEASE_TAG}. \
-          Rerun 'Build KDE Master' to generate it. Proceeding without dnf excludes."
-          fi
+          # build.sh installs exactly what the manifest lists
+          while read -r rpm; do
+            if [ ! -f "${RPM_DIR}/${rpm}" ]; then
+              echo "::error::${rpm} is listed in manifest.txt but missing from ${RELEASE_TAG}."
+              exit 1
+            fi
+          done < "${RPM_DIR}/manifest.txt"
+          echo "Fetched $(wc -l < "${RPM_DIR}/manifest.txt") packages, $(du -sh "${RPM_DIR}" | cut -f1)."
 
           if gh release download ${RELEASE_TAG} \
             --repo ${{ github.repository }} \
@@ -149,9 +156,9 @@ jobs:
             echo "Using pinned base image: ${PINNED}"
             echo "PINNED_BASE_IMAGE=${PINNED}" >> ${GITHUB_ENV}
           else
-            # Never fall back to quay.io directly: its 'rawhide' tag expires and
-            # the mirror is the whole reason this pipeline survives that.
-            MIRROR="ghcr.io/${{ github.repository_owner }}/fedora-plasma-canary-base"
+            # Never fall back to quay.io directly: its tags expire and the
+            # mirror is the whole reason this pipeline survives that.
+            MIRROR="ghcr.io/${{ github.repository_owner }}/fedora-plasma-canary-kinoite"
             echo "::warning::base-image-digest.txt not found in ${RELEASE_TAG} release. Falling back to the mirror's :latest."
             echo "PINNED_BASE_IMAGE=${MIRROR,,}:latest" >> ${GITHUB_ENV}
           fi
@@ -175,41 +182,6 @@ jobs:
           sudo -E $(command -v just) build \
             ${IMAGE_NAME} \
             ${DEFAULT_TAG}
-
-      - name: Extract build logs and clean image
-        if: always()
-        run: |
-          mkdir -p /tmp/kde-build-logs
-
-          CONTAINER=$(sudo podman create localhost/${IMAGE_NAME}:${DEFAULT_TAG} bash)
-          sudo podman cp ${CONTAINER}:/usr/lib/kde-build-logs/. /tmp/kde-build-logs/ || echo 'No logs found'
-          MOUNT=$(sudo podman mount ${CONTAINER})
-          sudo rm -rf ${MOUNT}/usr/lib/kde-build-logs
-          sudo podman umount ${CONTAINER}
-          sudo podman commit ${CONTAINER} localhost/${IMAGE_NAME}:${DEFAULT_TAG}
-          sudo podman rm ${CONTAINER}
-
-          EXIT_CODE_FILE=/tmp/kde-build-logs/exit-code
-          if [ -f "$EXIT_CODE_FILE" ]; then
-            BUILD_EXIT=$(cat "$EXIT_CODE_FILE")
-            if [ "$BUILD_EXIT" -ne 0 ]; then
-              echo "Build failed with exit code $BUILD_EXIT (from build.sh). See logs."
-              exit "$BUILD_EXIT"
-            fi
-          else
-            if [ "${{ steps.build-image.outcome }}" = "failure" ]; then
-              echo "Build image step failed and no exit-code file was written."
-              exit 1
-            fi
-          fi
-
-      - name: Upload build logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: kde-build-logs-${{ github.ref_name }}
-          path: /tmp/kde-build-logs/
-          retention-days: 7
 
       - name: Rechunk with rpm-ostree
         id: rechunk

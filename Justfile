@@ -4,7 +4,7 @@ export image_desc := env("IMAGE_DESC", "Fedora Plasma Canary - bootc image with 
 export image_keywords := env("IMAGE_KEYWORDS", "bootc,fedora,kde,plasma,development,canary")
 export image_logo_url := env("IMAGE_LOGO_URL", "https://avatars.githubusercontent.com/u/120078124?s=200&v=4")
 export default_tag := env("DEFAULT_TAG", "latest")
-export base_image := env("BASE_IMAGE", "ghcr.io/silverhadch/fedora-plasma-canary-base:latest")
+export base_image := env("BASE_IMAGE", "ghcr.io/silverhadch/fedora-plasma-canary-kinoite:latest")
 
 # Build the image
 build $target_image=image_name $tag=default_tag:

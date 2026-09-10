@@ -13,6 +13,11 @@ concurrency:
   group: kde-build-${{ github.ref_name }}
   cancel-in-progress: true
 
+env:
+  # Kinoite rawhide, mirrored daily. Also the default BASE_IMAGE in the
+  # Containerfile and the Justfile, keep in sync.
+  MIRROR_NAME: fedora-plasma-canary-kinoite
+
 jobs:
   build_kde:
     name: Build KDE from source
@@ -58,15 +63,13 @@ jobs:
           mkdir -p /home/runner/ccache
           chmod 777 /home/runner/ccache
 
-      - name: Mirror rawhide base image with daily tag
+      - name: Mirror Kinoite rawhide
         run: |
-          set -uo pipefail
+          set -euo pipefail
           mkdir -p /tmp/kde-work
           DATE=$(date +%Y%m%d)
-          TAG="rawhide-${DATE}"
-          MIRROR="ghcr.io/${{ github.repository_owner }}/fedora-plasma-canary-base"
+          MIRROR="ghcr.io/${{ github.repository_owner }}/${MIRROR_NAME}"
           MIRROR="${MIRROR,,}"
-          UPSTREAM="quay.io/fedora/fedora-bootc"
 
           if ! echo "${{ secrets.GITHUB_TOKEN }}" | sudo skopeo login ghcr.io \
                 -u ${{ github.actor }} --password-stdin; then
@@ -74,48 +77,34 @@ jobs:
             exit 1
           fi
 
-          # Quay expires and deletes tags, so 'rawhide' is not guaranteed to
-          # resolve on any given day. Newest wins: exact 'rawhide', else the
-          # newest rawhide-dated tag, else the newest version tag. Tags look
-          # like '44' *and* '45.20260906.0', so version-sort rather than
-          # integer-match -- '^[0-9]+$' would silently pick 44 over 45.x.
-          TAGS=$(sudo skopeo list-tags docker://${UPSTREAM} 2>/dev/null | jq -r '.Tags[]' || true)
+          # Kinoite rawhide is published in more than one place and any of them
+          # can go stale or lose its tag on a given day. The resolver inspects
+          # all of them plus the mirror's own :latest and returns whichever was
+          # built most recently, so the mirror only ever moves forward and a bad
+          # upstream day just reuses it.
+          SRC=$(sudo python3 .github/scripts/resolve-base.py --mirror "${MIRROR}:latest")
 
-          SRC=""
-          if grep -qx 'rawhide' <<<"${TAGS}"; then
-            SRC="${UPSTREAM}:rawhide"
+          if [ "${SRC}" = "${MIRROR}:latest" ]; then
+            echo "The mirror already holds the newest Kinoite rawhide."
+            PIN="${MIRROR}:latest"
           else
-            NEWEST=$(grep -E '^(rawhide-[0-9.]+|[0-9]+(\.[0-9]+)*)$' <<<"${TAGS}" \
-                     | sort -V | tail -1)
-            if [ -n "${NEWEST}" ]; then
-              echo "::warning::Upstream 'rawhide' tag is gone. Using newest available: ${UPSTREAM}:${NEWEST}."
-              SRC="${UPSTREAM}:${NEWEST}"
-            else
-              echo "::warning::Could not list any usable tag on ${UPSTREAM}."
-            fi
+            # Single-arch copy: only amd64 is built, and Kinoite is big enough
+            # that copying every architecture daily eats into the build budget.
+            sudo skopeo copy --retry-times 3 \
+              "docker://${SRC}" "docker://${MIRROR}:rawhide-${DATE}"
+            sudo skopeo copy \
+              "docker://${MIRROR}:rawhide-${DATE}" "docker://${MIRROR}:latest"
+            echo "Mirrored ${SRC} -> ${MIRROR}:rawhide-${DATE}"
+            PIN="${MIRROR}:rawhide-${DATE}"
           fi
 
-          if [ -n "${SRC}" ] && sudo skopeo copy --all --retry-times 3 \
-                docker://${SRC} docker://${MIRROR}:${TAG}; then
-            echo "Mirrored ${SRC} -> ${MIRROR}:${TAG}"
-            sudo skopeo copy --all docker://${MIRROR}:${TAG} docker://${MIRROR}:latest
-            PIN_TAG="${TAG}"
-          else
-            echo "::warning::Could not refresh the mirror from ${UPSTREAM}. Reusing ${MIRROR}:latest."
-            if ! sudo skopeo inspect docker://${MIRROR}:latest >/dev/null 2>&1; then
-              echo "::error::Upstream is unavailable and the mirror has no :latest to fall back to."
-              exit 1
-            fi
-            PIN_TAG="latest"
-          fi
+          DIGEST=$(sudo skopeo inspect --no-tags --format '{{.Digest}}' "docker://${PIN}")
+          echo "BASE_IMAGE=${MIRROR}@${DIGEST}" >> ${GITHUB_ENV}
+          printf 'rawhide=%s@%s\nsource=%s\n' "${MIRROR}" "${DIGEST}" "${SRC}" \
+            > /tmp/kde-work/base-image-digest.txt
+          echo "Pinned: $(head -1 /tmp/kde-work/base-image-digest.txt)"
 
-          DIGEST=$(sudo skopeo inspect docker://${MIRROR}:${PIN_TAG} --format '{{.Digest}}')
-          echo "BASE_IMAGE_TAG=${PIN_TAG}" >> ${GITHUB_ENV}
-          echo "MIRROR_IMAGE=${MIRROR}" >> ${GITHUB_ENV}
-          printf "rawhide=%s@%s\n" "${MIRROR}" "${DIGEST}" > /tmp/kde-work/base-image-digest.txt
-          echo "Pinned: $(cat /tmp/kde-work/base-image-digest.txt)"
-
-      - name: Build KDE in container
+      - name: Build and package KDE in container
         id: kde_build
         run: |
           set -uo pipefail
@@ -138,14 +127,18 @@ jobs:
 
           # timeout runs *under* sudo so it supervises podman directly and the
           # TERM actually reaches the container. Everything ccache has written
-          # to the bind mount up to that instant survives.
+          # to the bind mount up to that instant survives. Inside, kde-builder
+          # is stopped PACKAGE_RESERVE seconds before BUILD_DEADLINE so that
+          # turning the tree into RPMs always fits inside the same limit.
           sudo timeout --signal=TERM --kill-after=120 "${LIMIT}s" \
             podman run --rm \
               --privileged \
+              --env BUILD_DEADLINE="$(( $(date +%s) + LIMIT ))" \
+              --env PACKAGE_RESERVE=1800 \
               --volume "$(pwd)/build_files:/ctx:ro" \
               --volume "/home/runner/ccache:/ccache" \
               --volume "/tmp/kde-work:/work" \
-              ${MIRROR_IMAGE}:${BASE_IMAGE_TAG} \
+              "${BASE_IMAGE}" \
               bash /ctx/kde-build-container.sh
           rc=$?
 
@@ -182,11 +175,13 @@ jobs:
         with:
           name: kde-build-${{ github.ref_name }}
           path: |
-            /tmp/kde-work/kde-master.tar.zst
+            /tmp/kde-work/rpms/
+            /tmp/kde-work/meta/
             /tmp/kde-work/base-image-digest.txt
-            /tmp/kde-work/kde-runtime-deps.txt
-            /tmp/kde-work/kde-excluded-pkgs.txt
+          if-no-files-found: error
           retention-days: 1
+          # RPM payloads are already zstd-compressed
+          compression-level: 0
 
   release:
     name: Publish release
@@ -201,17 +196,24 @@ jobs:
           name: kde-build-${{ github.ref_name }}
           path: /tmp/kde-work/
 
-      - name: Upload KDE tar to kde-nightly release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: kde-nightly-${{ github.ref_name }}
-          name: KDE Master Nightly (${{ github.ref_name }})
-          body: "KDE git master build for branch ${{ github.ref_name }} — updated daily. Do not use directly, consumed by the image build pipeline."
-          prerelease: true
-          make_latest: false
-          files: |
-            /tmp/kde-work/kde-master.tar.zst
-            /tmp/kde-work/base-image-digest.txt
-            /tmp/kde-work/kde-runtime-deps.txt
-            /tmp/kde-work/kde-excluded-pkgs.txt
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish RPMs to kde-nightly release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: kde-nightly-${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd /tmp/kde-work
+
+          # Recreated rather than updated: the set of assets changes whenever a
+          # project is added or dropped, and a leftover RPM from an older build
+          # has no business sitting next to the new ones. One asset per RPM, so
+          # no single file runs into the release asset size limit.
+          gh release delete "${TAG}" --repo "${{ github.repository }}" --yes --cleanup-tag || true
+          gh release create "${TAG}" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --prerelease \
+            --latest=false \
+            --title "KDE Master Nightly (${{ github.ref_name }})" \
+            --notes "KDE git master built as RPMs for branch ${{ github.ref_name }}, updated daily. Consumed by the image build pipeline, install kde-canary from here only if you know why." \
+            rpms/*.rpm rpms/manifest.txt meta/replaced.txt base-image-digest.txt
