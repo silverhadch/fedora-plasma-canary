@@ -44,6 +44,7 @@ dnf5 install -y --skip-broken --skip-unavailable --allowerasing \
     cmake rpm-build \
     clang-devel kf6-kirigami-devel \
     kf6-kirigami-addons-devel clang-tools-extra git-clang-format jq \
+    PackageKit-glib-devel \
     'dnf-command(repoquery)' \
     || error "Some build deps failed to install"
 

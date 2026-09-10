@@ -42,6 +42,15 @@ if [ "$FAILED" -eq 0 ]; then
             FAILED=1
         fi
     done
+    # dolphin links this and will not start without it. It comes from the tar
+    # now that packagekit-qt is built rather than ignored, so check the file
+    # rather than the rpm: the distro PackageKit-Qt6 stays excluded.
+    for lib in /usr/lib64/libpackagekitqt6.so.2; do
+        if [ ! -e "$lib" ]; then
+            error "Expected $lib after extraction, not found. Did packagekit-qt build?"
+            FAILED=1
+        fi
+    done
 fi
 
 if [ "$FAILED" -eq 0 ]; then

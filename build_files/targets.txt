@@ -22,6 +22,7 @@ kunifiedpush
 kup
 kwalletmanager
 package-compatibility-helper
+packagekit-qt
 partitionmanager
 pulseaudio-qt
 selenium-webdriver-at-spi
