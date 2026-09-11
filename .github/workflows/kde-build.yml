@@ -8,9 +8,18 @@ on:
       - main
       - dev
   workflow_dispatch:
+    inputs:
+      packages_from_run:
+        description: >-
+          Skip the KDE build and repackage the project RPMs of this earlier
+          run ID instead (same branch, within the artifact retention). For
+          iterating on kde-canary without waiting hours for a build.
+        required: false
+        default: ''
 
 concurrency:
-  group: kde-build-${{ github.ref_name }}
+  # A repackaging run is minutes long and must not cancel a real build.
+  group: kde-build-${{ github.ref_name }}${{ inputs.packages_from_run && '-repackage' || '' }}
   cancel-in-progress: true
 
 env:
@@ -21,6 +30,7 @@ env:
 jobs:
   build_kde:
     name: Build KDE from source
+    if: ${{ !inputs.packages_from_run }}
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     permissions:
@@ -179,15 +189,20 @@ jobs:
             /tmp/kde-work/meta/
             /tmp/kde-work/base-image-digest.txt
           if-no-files-found: error
-          retention-days: 1
+          # Long enough to repackage a weekend's build on Monday
+          retention-days: 3
           # RPM payloads are already zstd-compressed
           compression-level: 0
 
   release:
-    name: Check and publish release
+    name: Package, check and publish release
     runs-on: ubuntu-24.04
     needs: build_kde
+    if: >-
+      ${{ !cancelled() && (needs.build_kde.result == 'success' ||
+          (needs.build_kde.result == 'skipped' && inputs.packages_from_run)) }}
     permissions:
+      actions: read
       contents: write
       packages: read
     steps:
@@ -210,13 +225,30 @@ jobs:
         with:
           name: kde-build-${{ github.ref_name }}
           path: /tmp/kde-work/
+          run-id: ${{ inputs.packages_from_run || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the kde-canary metapackage
+        run: |
+          set -euo pipefail
+          BASE=$(grep '^rawhide=' /tmp/kde-work/base-image-digest.txt | cut -d= -f2)
+          echo "BASE_IMAGE=${BASE}" >> "${GITHUB_ENV}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io \
+            -u ${{ github.actor }} --password-stdin
+
+          # On the base the image is built from, so dnf sees exactly the
+          # distro packages the image will have to swap out. This container
+          # gets rpm-build and is thrown away; the check below uses a fresh one.
+          sudo podman run --rm \
+            --volume "$(pwd)/build_files:/ctx:ro" \
+            --volume "/tmp/kde-work:/work" \
+            "${BASE}" \
+            bash -c 'dnf5 install -y rpm-build redhat-rpm-config && python3 /ctx/package-kde.py meta'
 
       - name: Check the image transaction installs
         run: |
           set -euo pipefail
-          BASE=$(grep '^rawhide=' /tmp/kde-work/base-image-digest.txt | cut -d= -f2)
-          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io \
-            -u ${{ github.actor }} --password-stdin
+          BASE="${BASE_IMAGE}"
 
           # A fresh copy of the exact base the RPMs were built on, running the
           # exact transaction build.sh will run. If it cannot install, stop

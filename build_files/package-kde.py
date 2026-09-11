@@ -25,10 +25,15 @@ One more package, kde-canary, carries the policy:
     D-Bus. Whatever the build already provides is dropped from that list, and
     so is whatever only the replaced packages provided.
 
-Runs at the end of kde-build-container.sh, in the container that did the
-build, because the Qt pins must name the exact Qt the tree compiled against.
-The compile container's dnf exclude drop-in has to be gone by then, or the
-repo queries below cannot see the packages being replaced.
+Two phases, because they need different places:
+
+  package-kde.py projects   End of kde-build-container.sh, in the container
+                            that did the build: the Qt pins must name the
+                            exact Qt the tree compiled against.
+  package-kde.py meta       Release job, on a pristine copy of the base, from
+                            the project RPMs alone. Needs dnf to see the
+                            distro packages, and can be rerun against an
+                            earlier build's RPMs without rebuilding KDE.
 """
 
 import concurrent.futures
@@ -96,9 +101,12 @@ LEGACY_NAME = re.compile(r"(^|-)(qt4|qt5|kf5|kdelibs4?)($|-)", re.IGNORECASE)
 
 # Capabilities that identify content: two packages providing one of these
 # ship the same thing. mimehandler() and bare application() are excluded,
-# every file manager handles inode/directory.
+# every file manager handles inode/directory. Only versioned library names
+# count: rpm provides a lib*.so without a SONAME under its bare file name,
+# which is what QML plugins look like, and KF5 Sonnet's
+# libsonnetquickplugin.so is not KF6 Sonnet's.
 EVIDENCE = re.compile(
-    r"^(?:\S+\.so[\w.]*\(\)(?:\(64bit\))?"
+    r"^(?:lib[^\s/()]*\.so\.\d[\w.]*\(\)(?:\(64bit\))?"
     r"|cmake\(.+\)|pkgconfig\(.+\)|application\(.+\.desktop\)"
     r"|metainfo\(.+\)|qt6qmlimport\(.+\)|python3(?:\.\d+)?dist\(.+\))$")
 
@@ -116,7 +124,11 @@ VERSIONED = re.compile(r"\s+(?:<=|>=|=|<|>)\s+\S+$")
 # Keep what kde-builder installed byte for byte: no stripping, no shebang
 # mangling, no rpath checks, no build-id links. The dependency generators run
 # during file classification, not in these hooks, so they are unaffected.
+# Plugins and QML modules are loaded, never linked, so they provide nothing:
+# rpm would advertise a SONAME-less lib*.so under its bare file name, the same
+# name the Qt5 build of the same plugin carries.
 SPEC_PREAMBLE = """\
+%global __provides_exclude_from ^%{_libdir}/qt6/(plugins|qml)/.*\\.so$
 %global debug_package %{nil}
 %global __os_install_post %{nil}
 %global __arch_install_post %{nil}
@@ -378,6 +390,15 @@ def provides_of(rpms):
     return caps
 
 
+def files_of(rpms):
+    files = set()
+    for i in range(0, len(rpms), 100):
+        out = subprocess.run(["rpm", "-qpl", *rpms[i:i + 100]],
+                             capture_output=True, text=True, check=True).stdout
+        files.update(line for line in out.splitlines() if line.startswith("/"))
+    return files
+
+
 def repoquery_raw(*args):
     process = subprocess.run(["dnf5", "repoquery", f"--arch={ARCHES}", *args],
                              capture_output=True, text=True)
@@ -445,14 +466,24 @@ def find_replaced(ours, our_files, sources):
     guarded = {n for n in direct if NEVER_REPLACE.fullmatch(sources.get(n, n))}
     if guarded:
         logger.error(f"The build overlaps {', '.join(sorted(guarded))}. Not obsoleting "
-                     f"those; the image install will report the conflicting files.")
+                     f"those; the install check will report the conflicting files.")
         direct -= guarded
+    # The build is Qt6 only, and Fedora co-installs KF5 and KF6 by design, so
+    # an overlap with a Qt4/Qt5/KDE 4 package is a false match. If it is a real
+    # file conflict after all, the install check names the files.
+    legacy = {n for n in direct if LEGACY_NAME.search(n)}
+    if legacy:
+        logger.warning(f"Not replacing Qt4/Qt5/KDE 4 package(s) that matched the build: "
+                       f"{', '.join(sorted(legacy))}")
+        direct -= legacy
 
     srpms = {sources[n] for n in direct if n in sources}
     siblings = {n for n, s in sources.items() if s in srpms} - direct
-    siblings = {n for n in siblings if not LEGACY_NAME.search(n)}
-    sibling_caps = evidence_of(siblings) if siblings else {}
-    covered = {n for n in siblings if sibling_caps.get(n, set()) <= ours}
+    candidates = {n for n in siblings if not LEGACY_NAME.search(n)}
+    sibling_caps = evidence_of(candidates) if candidates else {}
+    covered = {n for n in candidates if sibling_caps.get(n, set()) <= ours}
+    # Every sibling not replaced stays, legacy ones included, and whatever
+    # only they provide must not be re-stated as a requirement.
     left = siblings - covered
     if left:
         logger.info(f"Leaving {len(left)} sibling package(s) in place, they provide things "
@@ -494,17 +525,20 @@ def restate(caps, *, isa, downstream, satisfied, stale):
     return kept
 
 
-def meta_spec(version, projects, *, replaced, downstream, requires, recommends):
+def meta_spec(version, release, projects, *, replaced, downstream, requires, recommends):
+    # Release is written out rather than %{?dist}: this runs in a different
+    # container from the project builds, and the exact version-release pairing
+    # below must match them to the letter.
     lines = [
         "Name:    kde-canary",
         f"Version: {version}",
-        "Release: 1%{?dist}",
+        f"Release: {release}",
         "Summary: KDE git master in place of Fedora's KDE packages",
         "License: MIT",
         "URL:     https://invent.kde.org",
         "",
     ]
-    lines += [f"Requires: kde-canary-{p}%{{?_isa}} = %{{version}}-%{{release}}" for p in projects]
+    lines += [f"Requires: kde-canary-{p}%{{?_isa}} = {version}-{release}" for p in projects]
     lines.append("")
     for name in sorted(replaced):
         lines += [f"Provides: {name} = {REPLACED_EVR}",
@@ -527,7 +561,8 @@ def meta_spec(version, projects, *, replaced, downstream, requires, recommends):
     return "\n".join(lines)
 
 
-def main():
+def phase_projects():
+    """Phase one: an RPM per project, in the container that built them."""
     if not os.path.isdir(TREE) or not os.listdir(TREE):
         sys.exit(f"Nothing to package: {TREE} is empty. Did ninja-hijack.rb run?")
     for d in (OUT, TOPDIR):
@@ -536,7 +571,6 @@ def main():
         os.makedirs(d, exist_ok=True)
 
     version = "0^" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M")
-    isa = rpm_eval("%{?_isa}")
     projects = projects_in_order()
     logger.info(f"Packaging {len(projects)} projects as version {version}.")
 
@@ -545,14 +579,13 @@ def main():
     if missing:
         sys.exit(f"The build is missing {', '.join(missing)}. Refusing to package it.")
 
-    specs, our_files = {}, set()
+    specs = {}
     for project in projects:
         filelist = os.path.join(TOPDIR, f"{project}.files")
         files, elves = write_filelist(project, filelist)
         if not files:
             logger.info(f"{project} installed no files, skipping it.")
             continue
-        our_files.update(files)
         pins = qt_pins(private_qt_libs(elves))
         if pins:
             logger.info(f"{project}: pinned to " +
@@ -566,6 +599,35 @@ def main():
         futures = {pool.submit(rpmbuild, f"kde-canary-{p}", s): p for p, s in specs.items()}
         for future in concurrent.futures.as_completed(futures):
             rpms.append(future.result())
+
+    logger.info(f"Wrote {len(rpms)} project packages to {OUT}. "
+                f"package-kde.py meta builds kde-canary from them.")
+
+
+def phase_meta():
+    """Phase two: kde-canary, from the project RPMs and the repos."""
+    os.makedirs(LOGS, exist_ok=True)
+    os.makedirs(TOPDIR, exist_ok=True)
+    os.makedirs(META, exist_ok=True)
+    stale_meta = os.path.join(OUT, "kde-canary.rpm")
+    if os.path.exists(stale_meta):
+        os.remove(stale_meta)
+    rpms = sorted(os.path.join(OUT, f) for f in os.listdir(OUT)
+                  if f.startswith("kde-canary-") and f.endswith(".rpm"))
+    if not rpms:
+        sys.exit(f"No kde-canary-*.rpm in {OUT}. Run package-kde.py projects first.")
+
+    info = subprocess.run(["rpm", "-qp", "--qf", "%{NAME} %{VERSION} %{RELEASE}\n", *rpms],
+                          capture_output=True, text=True, check=True).stdout.split("\n")
+    rows = [line.split() for line in info if line.strip()]
+    evrs = {(v, r) for _, v, r in rows}
+    if len(evrs) != 1:
+        sys.exit(f"The project RPMs come from more than one build: {sorted(evrs)}")
+    (version, release), = evrs
+    specs = sorted(name.removeprefix("kde-canary-") for name, _, _ in rows)
+    isa = rpm_eval("%{?_isa}")
+    our_files = files_of(rpms)
+    logger.info(f"Building kde-canary {version}-{release} over {len(specs)} project packages.")
 
     ours = provides_of(rpms)
     sources = source_map()
@@ -607,13 +669,23 @@ def main():
                 f"{len(requires)} requires and {len(recommends)} recommends re-stated.")
 
     rpms.append(rpmbuild("kde-canary", meta_spec(
-        version, sorted(specs), replaced=replaced, downstream=downstream,
+        version, release, specs, replaced=replaced, downstream=downstream,
         requires=requires, recommends=recommends)))
 
-    names = sorted(os.path.basename(r) for r in rpms)
+    packages = sorted(os.path.basename(r) for r in rpms)
     with open(os.path.join(OUT, "manifest.txt"), "w") as f:
-        f.write("\n".join(names) + "\n")
-    logger.info(f"Wrote {len(names)} packages and manifest.txt to {OUT}.")
+        f.write("\n".join(packages) + "\n")
+    logger.info(f"Wrote kde-canary and manifest.txt ({len(packages)} packages) to {OUT}.")
+
+
+def main():
+    phase = sys.argv[1] if len(sys.argv) > 1 else ""
+    if phase == "projects":
+        phase_projects()
+    elif phase == "meta":
+        phase_meta()
+    else:
+        sys.exit("usage: package-kde.py projects|meta")
 
 
 if __name__ == "__main__":
