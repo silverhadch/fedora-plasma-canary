@@ -184,17 +184,49 @@ jobs:
           compression-level: 0
 
   release:
-    name: Publish release
+    name: Check and publish release
     runs-on: ubuntu-24.04
     needs: build_kde
     permissions:
       contents: write
+      packages: read
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
       - name: Download build artifacts
         uses: actions/download-artifact@v8
         with:
           name: kde-build-${{ github.ref_name }}
           path: /tmp/kde-work/
+
+      - name: Check the image transaction installs
+        run: |
+          set -euo pipefail
+          BASE=$(grep '^rawhide=' /tmp/kde-work/base-image-digest.txt | cut -d= -f2)
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io \
+            -u ${{ github.actor }} --password-stdin
+
+          # A fresh copy of the exact base the RPMs were built on, running the
+          # exact transaction build.sh will run. If it cannot install, stop
+          # here: the release keeps the last good RPMs and the image keeps
+          # building from them.
+          sudo podman run --rm \
+            --volume "$(pwd)/build_files:/ctx:ro" \
+            --volume "/tmp/kde-work/rpms:/rpms:ro" \
+            "${BASE}" \
+            bash /ctx/check-install.sh /rpms
 
       - name: Publish RPMs to kde-nightly release
         env:

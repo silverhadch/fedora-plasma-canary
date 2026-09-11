@@ -103,6 +103,10 @@ elif [ "$rc" -ne 0 ]; then
     die "build-kde.py failed ($rc). Logs at $LOG_DIR"
 fi
 
+# package-kde.py decides what the build replaces by asking dnf which distro
+# packages overlap it, so dnf has to see them again.
+rm -f /etc/dnf/libdnf5.conf.d/90-kde-selfbuilt.conf
+
 log "Packaging..."
 python3 /ctx/package-kde.py 2>&1 | tee -a "$LOG_DIR/package.log" \
     || die "package-kde.py failed, see package.log and $LOG_DIR/rpmbuild/."

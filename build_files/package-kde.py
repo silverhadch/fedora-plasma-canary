@@ -12,6 +12,11 @@ One more package, kde-canary, carries the policy:
 
   - It obsoletes every Fedora package the build replaces, so dnf swaps them
     out in the same transaction instead of rpm -e --nodeps leaving a hole.
+    What counts as replaced is decided from evidence, after the build: a
+    Fedora package that provides the same sonames, cmake(), pkgconfig() or
+    .desktop IDs as the build, or owns the same files in /usr/bin or /etc.
+    Module names are not trusted: in rawhide, 'attica' is the Qt4 library
+    from 2014, not the KF6 framework.
   - It provides their names, so distro packages that ask for them by name
     (kdevelop wanting kf6-ktexteditor) are still satisfied.
   - It obsoletes Fedora's downstream Plasma configuration without providing it.
@@ -22,12 +27,15 @@ One more package, kde-canary, carries the policy:
 
 Runs at the end of kde-build-container.sh, in the container that did the
 build, because the Qt pins must name the exact Qt the tree compiled against.
+The compile container's dnf exclude drop-in has to be gone by then, or the
+repo queries below cannot see the packages being replaced.
 """
 
 import concurrent.futures
 import datetime
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -63,6 +71,45 @@ MUST_SHIP = (
     # distro PackageKit-Qt6, which kde-canary obsoletes.
     "/usr/lib64/libpackagekitqt6.so.2",
 )
+
+# Fedora's own Plasma configuration layered over upstream KDE defaults. The
+# image ships what KDE ships, so kde-canary obsoletes these without providing
+# them, and a requirement on them is never re-stated. sddm is here because
+# Plasma Login Manager is built from source and replaces it.
+DOWNSTREAM_CONFIG = [re.compile(p) for p in (
+    r"kde-settings.*",
+    r"plasma-lookandfeel-fedora",
+    r"plasma-welcome-fedora",
+    r"fedora-chromium-config-kde",
+    r"sddm(-.*)?",
+)]
+
+# Source packages that are never replaced whatever the evidence says. If the
+# build overlaps Qt, that is a file conflict to fix, not a reason to obsolete
+# the toolkit the whole desktop runs on.
+NEVER_REPLACE = re.compile(r"qt[456](-.*)?")
+
+# Qt4/Qt5/kdelibs4-era packages. Never pulled in as siblings of a replaced
+# source package: qca builds qca-qt5 next to qca-qt6, and only the latter
+# overlaps the build. The Qt5 one conflicts with nothing and may be needed.
+LEGACY_NAME = re.compile(r"(^|-)(qt4|qt5|kf5|kdelibs4?)($|-)", re.IGNORECASE)
+
+# Capabilities that identify content: two packages providing one of these
+# ship the same thing. mimehandler() and bare application() are excluded,
+# every file manager handles inode/directory.
+EVIDENCE = re.compile(
+    r"^(?:\S+\.so[\w.]*\(\)(?:\(64bit\))?"
+    r"|cmake\(.+\)|pkgconfig\(.+\)|application\(.+\.desktop\)"
+    r"|metainfo\(.+\)|qt6qmlimport\(.+\)|python3(?:\.\d+)?dist\(.+\))$")
+
+# Paths the primary repo metadata carries, so dnf can match them without
+# downloading filelists.
+PRIMARY_PATHS = ("/usr/bin/", "/usr/sbin/", "/etc/")
+
+# One capability in repoquery --qf output, however the list is separated
+CAP_TOKEN = re.compile(r"[^\s,()]+(?:\([^\s,()]*\))+")
+
+ARCHES = f"{platform.machine()},noarch"
 
 VERSIONED = re.compile(r"\s+(?:<=|>=|=|<|>)\s+\S+$")
 
@@ -331,6 +378,88 @@ def provides_of(rpms):
     return caps
 
 
+def repoquery_raw(*args):
+    process = subprocess.run(["dnf5", "repoquery", f"--arch={ARCHES}", *args],
+                             capture_output=True, text=True)
+    if process.returncode != 0:
+        raise RuntimeError(f"dnf5 repoquery {' '.join(args[:2])} failed "
+                           f"({process.returncode}): {process.stderr.strip()}")
+    return process.stdout
+
+
+def repoquery(*args):
+    return sorted({line.strip() for line in repoquery_raw(*args).splitlines() if line.strip()})
+
+
+def chunks(items, size=100):
+    items = sorted(items)
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def source_map():
+    """Binary package name -> source package name, for everything in the repos."""
+    sources = {}
+    # A literal newline: dnf5 does not terminate --qf output on its own
+    for line in repoquery("--qf", "%{name} %{sourcerpm}\n"):
+        name, _, srpm = line.partition(" ")
+        if srpm and srpm != "(none)":
+            sources[name] = srpm.rsplit("-", 2)[0]
+    return sources
+
+
+def evidence_of(names):
+    """name -> the identifying capabilities each package provides, in one query."""
+    caps, current = {}, None
+    for line in repoquery_raw("--qf", "@@%{name}@@\n%{provides}\n", *sorted(names)).splitlines():
+        header = re.fullmatch(r"@@(.+)@@", line.strip())
+        if header:
+            current = caps.setdefault(header.group(1), set())
+        elif current is not None:
+            current.update(t for t in CAP_TOKEN.findall(line) if EVIDENCE.match(t))
+    return caps
+
+
+def find_replaced(ours, our_files, sources):
+    """The Fedora packages this build replaces, from evidence rather than names.
+
+    Direct: a package that provides an identifying capability the build also
+    provides, or owns a file the build also ships. Those would conflict, so
+    they must go. Siblings: the other binary packages of the same source
+    package, when everything identifying they provide is covered by the build
+    too. That takes plasma-workspace-common and kf6-kio-doc along, and leaves
+    qca-qt5 or appstream-compose alone when the build does not ship them.
+
+    Returns (replaced, left): the siblings left in place matter too, see
+    main()."""
+    direct = set()
+    evidence = [c for c in ours if EVIDENCE.match(c) and "," not in c]
+    for chunk in chunks(evidence):
+        direct.update(repoquery("--qf", "%{name}\n", "--whatprovides=" + ",".join(chunk)))
+    paths = [p for p in our_files if p.startswith(PRIMARY_PATHS) and "," not in p]
+    try:
+        for chunk in chunks(paths):
+            direct.update(repoquery("--qf", "%{name}\n", "--file=" + ",".join(chunk)))
+    except RuntimeError as e:
+        logger.warning(f"File ownership query failed, going by capabilities only: {e}")
+
+    guarded = {n for n in direct if NEVER_REPLACE.fullmatch(sources.get(n, n))}
+    if guarded:
+        logger.error(f"The build overlaps {', '.join(sorted(guarded))}. Not obsoleting "
+                     f"those; the image install will report the conflicting files.")
+        direct -= guarded
+
+    srpms = {sources[n] for n in direct if n in sources}
+    siblings = {n for n, s in sources.items() if s in srpms} - direct
+    siblings = {n for n in siblings if not LEGACY_NAME.search(n)}
+    sibling_caps = evidence_of(siblings) if siblings else {}
+    covered = {n for n in siblings if sibling_caps.get(n, set()) <= ours}
+    left = siblings - covered
+    if left:
+        logger.info(f"Leaving {len(left)} sibling package(s) in place, they provide things "
+                    f"the build does not: {', '.join(sorted(left))}")
+    return direct | covered, left
+
+
 def restate(caps, *, isa, downstream, satisfied, stale):
     """The requirements of the replaced packages that still need saying.
 
@@ -351,7 +480,7 @@ def restate(caps, *, isa, downstream, satisfied, stale):
             continue
         name = VERSIONED.sub("", cap).strip()
         bare = name[:-len(isa)] if isa and name.endswith(isa) else name
-        if bare in downstream:
+        if bare in downstream or any(p.fullmatch(bare) for p in DOWNSTREAM_CONFIG):
             continue
         if name in satisfied or bare in satisfied:
             continue
@@ -438,18 +567,41 @@ def main():
         for future in concurrent.futures.as_completed(futures):
             rpms.append(future.result())
 
-    downstream = set(read_list("downstream.txt")) - KEEP
-    replaced = set(read_list("replaced.txt")) - downstream - KEEP
-
     ours = provides_of(rpms)
+    sources = source_map()
+    downstream = {n for n in sources if any(p.fullmatch(n) for p in DOWNSTREAM_CONFIG)} - KEEP
+    found, left = find_replaced(ours, our_files, sources)
+    found -= KEEP
+    replaced = found - downstream
+    logger.info(f"The build replaces {len(replaced)} Fedora package(s), and "
+                f"{len(found & downstream)} downstream config package(s) overlap it.")
+
+    # Harvested only now, from the packages actually replaced. The distro
+    # packages' own requirements are what no generator can see. What they and
+    # the siblings left behind provided tells which of those requirements went
+    # stale: a sibling left in place is usually tied to its replaced main
+    # package by an exact-version Requires, so pointing kde-canary at it would
+    # ask for a transaction that cannot exist.
+    names = sorted(replaced)
+    harvested = {kind: repoquery(kind, *names) if names else []
+                 for kind in ("--requires", "--recommends")}
+    from_replaced_sources = sorted(replaced | left)
+    harvested["--provides"] = (repoquery("--provides", *from_replaced_sources)
+                               if from_replaced_sources else [])
+    for name, lines in (("replaced.txt", names), ("downstream.txt", sorted(downstream)),
+                        ("left-siblings.txt", sorted(left)),
+                        ("harvest-requires.txt", harvested["--requires"]),
+                        ("harvest-recommends.txt", harvested["--recommends"])):
+        with open(os.path.join(META, name), "w") as f:
+            f.write("\n".join(lines) + "\n")
+
     meta = replaced | {name + isa for name in replaced}
     satisfied = ours | meta | our_files
-    stale = {VERSIONED.sub("", c).strip() for c in read_list("replaced-provides.txt")} - satisfied
+    stale = {VERSIONED.sub("", c).strip() for c in harvested["--provides"]} - satisfied
 
     common = dict(isa=isa, downstream=downstream, satisfied=satisfied, stale=stale)
-    requires = restate(read_list("harvest-requires.txt"), **common)
-    recommends = restate(read_list("harvest-recommends.txt") + read_list("fedora-rundeps.txt"),
-                         **common)
+    requires = restate(harvested["--requires"], **common)
+    recommends = restate(harvested["--recommends"] + read_list("fedora-rundeps.txt"), **common)
     recommends = {c for c in recommends if c not in requires and c + isa not in requires}
     logger.info(f"kde-canary: {len(replaced)} replaced, {len(downstream)} downstream obsoleted, "
                 f"{len(requires)} requires and {len(recommends)} recommends re-stated.")
