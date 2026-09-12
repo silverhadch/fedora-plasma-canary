@@ -63,7 +63,7 @@ log "Installing kde-builder..."
 git clone https://invent.kde.org/sdk/kde-builder.git /usr/share/kde-builder
 ln -sf /usr/share/kde-builder/kde-builder /usr/bin/kde-builder
 
-log "Installing KDE build dependencies and recording what the build replaces..."
+log "Installing KDE build dependencies..."
 python3 /ctx/install-kde-deps.py 2>&1 | tee -a "$LOG_DIR/deps.log" \
     || die "install-kde-deps.py failed, see deps.log."
 

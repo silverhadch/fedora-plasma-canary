@@ -12,11 +12,11 @@ One more package, kde-canary, carries the policy:
 
   - It obsoletes every Fedora package the build replaces, so dnf swaps them
     out in the same transaction instead of rpm -e --nodeps leaving a hole.
-    What counts as replaced is decided from evidence, after the build: a
-    Fedora package that provides the same sonames, cmake(), pkgconfig() or
-    .desktop IDs as the build, or owns the same files in /usr/bin or /etc.
-    Module names are not trusted: in rawhide, 'attica' is the Qt4 library
-    from 2014, not the KF6 framework.
+    Replaced means one thing: the package owns a file this build also ships.
+    That is the definition of a file conflict, so the answer is exact rather
+    than inferred, and it is read from the rpmdb of the very image the swap
+    will happen in. Guessing it from module names or shared capabilities is
+    what obsoleted the Qt4 'attica' and KF5 Sonnet in earlier builds.
   - It provides their names, so distro packages that ask for them by name
     (kdevelop wanting kf6-ktexteditor) are still satisfied.
   - It obsoletes Fedora's downstream Plasma configuration without providing it.
@@ -30,9 +30,9 @@ Two phases, because they need different places:
   package-kde.py projects   End of kde-build-container.sh, in the container
                             that did the build: the Qt pins must name the
                             exact Qt the tree compiled against.
-  package-kde.py meta       Release job, on a pristine copy of the base, from
-                            the project RPMs alone. Needs dnf to see the
-                            distro packages, and can be rerun against an
+  package-kde.py meta       Release job, inside a container of the pinned
+                            base, from the project RPMs alone. Reads only
+                            that image's rpmdb, so it can be rerun against an
                             earlier build's RPMs without rebuilding KDE.
 """
 
@@ -40,7 +40,6 @@ import concurrent.futures
 import datetime
 import logging
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -89,35 +88,30 @@ DOWNSTREAM_CONFIG = [re.compile(p) for p in (
     r"sddm(-.*)?",
 )]
 
-# Source packages that are never replaced whatever the evidence says. If the
-# build overlaps Qt, that is a file conflict to fix, not a reason to obsolete
-# the toolkit the whole desktop runs on.
-NEVER_REPLACE = re.compile(r"qt[456](-.*)?")
+# Packages removed even when no file of theirs collides: Fedora's Plasma
+# configuration layered over upstream defaults, and projects deliberately not
+# built (kde-builder's ignore-projects). Obsoleted without being provided, so
+# nothing pulls them back.
+CURATED_REMOVALS = [re.compile(p) for p in (
+    r"oxygen(-.*)?",
+    r"kwin-x11",
+    r"plasma-nano",
+    r"sddm-kcm",
+)]
 
-# Qt4/Qt5/kdelibs4-era packages. Never pulled in as siblings of a replaced
-# source package: qca builds qca-qt5 next to qca-qt6, and only the latter
-# overlaps the build. The Qt5 one conflicts with nothing and may be needed.
-LEGACY_NAME = re.compile(r"(^|-)(qt4|qt5|kf5|kdelibs4?)($|-)", re.IGNORECASE)
+# Obsoleting any of these would take the image with it. A collision here is a
+# packaging bug in the build, never something to resolve by replacing them.
+PROTECTED = re.compile(
+    r"^(?:filesystem|setup|glibc.*|kernel.*|systemd.*|rpm|rpm-libs|dnf5?(?:-.*)?"
+    r"|libdnf5.*|bash|coreutils|util-linux.*|shadow-utils|selinux-policy.*"
+    r"|ostree|bootc|rpm-ostree|python3|python3-libs)$")
 
-# Capabilities that identify content: two packages providing one of these
-# ship the same thing. mimehandler() and bare application() are excluded,
-# every file manager handles inode/directory. Only versioned library names
-# count: rpm provides a lib*.so without a SONAME under its bare file name,
-# which is what QML plugins look like, and KF5 Sonnet's
-# libsonnetquickplugin.so is not KF6 Sonnet's.
-EVIDENCE = re.compile(
-    r"^(?:lib[^\s/()]*\.so\.\d[\w.]*\(\)(?:\(64bit\))?"
-    r"|cmake\(.+\)|pkgconfig\(.+\)|application\(.+\.desktop\)"
-    r"|metainfo\(.+\)|qt6qmlimport\(.+\)|python3(?:\.\d+)?dist\(.+\))$")
-
-# Paths the primary repo metadata carries, so dnf can match them without
-# downloading filelists.
-PRIMARY_PATHS = ("/usr/bin/", "/usr/sbin/", "/etc/")
-
-# One capability in repoquery --qf output, however the list is separated
-CAP_TOKEN = re.compile(r"[^\s,()]+(?:\([^\s,()]*\))+")
-
-ARCHES = f"{platform.machine()},noarch"
+# A requirement our Provides cannot satisfy. kde-canary provides every
+# replaced name at epoch 999, so >= and > are covered; an exact or upper-bound
+# requirement on a replaced package is not, and whatever carries it has to go
+# in the same transaction. This is what takes plasma-workspace-common along
+# with plasma-workspace: subpackages pin their siblings to an exact version.
+UNSATISFIABLE = re.compile(r"^(\S+?)(\(\w[\w-]*\))?\s*(?:=|<=|<)\s*\S+$")
 
 VERSIONED = re.compile(r"\s+(?:<=|>=|=|<|>)\s+\S+$")
 
@@ -391,104 +385,97 @@ def provides_of(rpms):
 
 
 def files_of(rpms):
+    """Every non-directory path the built packages ship."""
     files = set()
     for i in range(0, len(rpms), 100):
-        out = subprocess.run(["rpm", "-qpl", *rpms[i:i + 100]],
-                             capture_output=True, text=True, check=True).stdout
-        files.update(line for line in out.splitlines() if line.startswith("/"))
+        out = rpm_query("-qp", "--qf", "[%{FILENAMES}\t%{FILEMODES:perms}\n]", *rpms[i:i + 100])
+        for line in out.splitlines():
+            path, _, perms = line.rpartition("\t")
+            if path.startswith("/") and not perms.startswith("d"):
+                files.add(path)
     return files
 
 
-def repoquery_raw(*args):
-    process = subprocess.run(["dnf5", "repoquery", f"--arch={ARCHES}", *args],
-                             capture_output=True, text=True)
-    if process.returncode != 0:
-        raise RuntimeError(f"dnf5 repoquery {' '.join(args[:2])} failed "
-                           f"({process.returncode}): {process.stderr.strip()}")
-    return process.stdout
+def rpm_query(*args):
+    """rpm against the rpmdb of the image this runs in."""
+    return subprocess.run(["rpm", *args], capture_output=True, text=True,
+                          check=True).stdout
 
 
-def repoquery(*args):
-    return sorted({line.strip() for line in repoquery_raw(*args).splitlines() if line.strip()})
+def installed():
+    """Every installed package: its EVR, and every non-directory path it owns.
+
+    One query rather than rpm -qf per file, because rpm -qf needs the file to
+    exist on disk and most of these will not: the container is the base image,
+    not the built one. Directories are skipped, since sharing /usr/bin with
+    the filesystem package is not a conflict."""
+    evr, owner = {}, {}
+    current = None
+    for line in rpm_query("-qa", "--qf",
+                          "@@%{NAME}\t%|EPOCH?{%{EPOCH}:}:{}|%{VERSION}-%{RELEASE}\n"
+                          "[%{FILENAMES}\t%{FILEMODES:perms}\n]").splitlines():
+        if line.startswith("@@"):
+            current, _, version = line[2:].partition("\t")
+            evr[current] = version
+        elif "\t" in line and current:
+            path, _, perms = line.rpartition("\t")
+            if not perms.startswith("d"):
+                owner.setdefault(path, current)
+    return evr, owner
 
 
-def chunks(items, size=100):
-    items = sorted(items)
-    return [items[i:i + size] for i in range(0, len(items), size)]
+def requirements():
+    """name -> its requirements, for every installed package."""
+    reqs, current = {}, None
+    for line in rpm_query("-qa", "--qf", "@@%{NAME}\n[%{REQUIRENEVRS}\n]").splitlines():
+        if line.startswith("@@"):
+            current = reqs.setdefault(line[2:], set())
+        elif current is not None and line.strip():
+            current.add(line.strip())
+    return reqs
 
 
-def source_map():
-    """Binary package name -> source package name, for everything in the repos."""
-    sources = {}
-    # A literal newline: dnf5 does not terminate --qf output on its own
-    for line in repoquery("--qf", "%{name} %{sourcerpm}\n"):
-        name, _, srpm = line.partition(" ")
-        if srpm and srpm != "(none)":
-            sources[name] = srpm.rsplit("-", 2)[0]
-    return sources
+def find_replaced(our_files, evr, owner):
+    """Installed packages this build cannot coexist with.
 
+    Every package owning a file the build also ships, plus the curated
+    removals, plus the closure of whatever then carries a requirement kde-canary
+    cannot satisfy. No inference from names or capabilities: a file collision
+    is the only thing that forces a package out, and it is not a judgement
+    call."""
+    replaced = {owner[path] for path in our_files if path in owner}
+    logger.info(f"{len(replaced)} installed package(s) own files this build ships.")
 
-def evidence_of(names):
-    """name -> the identifying capabilities each package provides, in one query."""
-    caps, current = {}, None
-    for line in repoquery_raw("--qf", "@@%{name}@@\n%{provides}\n", *sorted(names)).splitlines():
-        header = re.fullmatch(r"@@(.+)@@", line.strip())
-        if header:
-            current = caps.setdefault(header.group(1), set())
-        elif current is not None:
-            current.update(t for t in CAP_TOKEN.findall(line) if EVIDENCE.match(t))
-    return caps
+    fatal = {n for n in replaced if PROTECTED.fullmatch(n)}
+    if fatal:
+        for name in sorted(fatal):
+            example = next(p for p in sorted(our_files) if owner.get(p) == name)
+            logger.error(f"The build ships {example}, owned by {name}.")
+        sys.exit(f"Refusing to obsolete {', '.join(sorted(fatal))}. The build is shipping "
+                 f"files it has no business shipping; fix that rather than replacing them.")
 
+    curated = {n for n in evr if any(p.fullmatch(n) for p in CURATED_REMOVALS)} - replaced
+    if curated:
+        logger.info(f"Also removing {len(curated)} package(s) by policy: "
+                    f"{', '.join(sorted(curated))}")
+        replaced |= curated
 
-def find_replaced(ours, our_files, sources):
-    """The Fedora packages this build replaces, from evidence rather than names.
-
-    Direct: a package that provides an identifying capability the build also
-    provides, or owns a file the build also ships. Those would conflict, so
-    they must go. Siblings: the other binary packages of the same source
-    package, when everything identifying they provide is covered by the build
-    too. That takes plasma-workspace-common and kf6-kio-doc along, and leaves
-    qca-qt5 or appstream-compose alone when the build does not ship them.
-
-    Returns (replaced, left): the siblings left in place matter too, see
-    main()."""
-    direct = set()
-    evidence = [c for c in ours if EVIDENCE.match(c) and "," not in c]
-    for chunk in chunks(evidence):
-        direct.update(repoquery("--qf", "%{name}\n", "--whatprovides=" + ",".join(chunk)))
-    paths = [p for p in our_files if p.startswith(PRIMARY_PATHS) and "," not in p]
-    try:
-        for chunk in chunks(paths):
-            direct.update(repoquery("--qf", "%{name}\n", "--file=" + ",".join(chunk)))
-    except RuntimeError as e:
-        logger.warning(f"File ownership query failed, going by capabilities only: {e}")
-
-    guarded = {n for n in direct if NEVER_REPLACE.fullmatch(sources.get(n, n))}
-    if guarded:
-        logger.error(f"The build overlaps {', '.join(sorted(guarded))}. Not obsoleting "
-                     f"those; the install check will report the conflicting files.")
-        direct -= guarded
-    # The build is Qt6 only, and Fedora co-installs KF5 and KF6 by design, so
-    # an overlap with a Qt4/Qt5/KDE 4 package is a false match. If it is a real
-    # file conflict after all, the install check names the files.
-    legacy = {n for n in direct if LEGACY_NAME.search(n)}
-    if legacy:
-        logger.warning(f"Not replacing Qt4/Qt5/KDE 4 package(s) that matched the build: "
-                       f"{', '.join(sorted(legacy))}")
-        direct -= legacy
-
-    srpms = {sources[n] for n in direct if n in sources}
-    siblings = {n for n, s in sources.items() if s in srpms} - direct
-    candidates = {n for n in siblings if not LEGACY_NAME.search(n)}
-    sibling_caps = evidence_of(candidates) if candidates else {}
-    covered = {n for n in candidates if sibling_caps.get(n, set()) <= ours}
-    # Every sibling not replaced stays, legacy ones included, and whatever
-    # only they provide must not be re-stated as a requirement.
-    left = siblings - covered
-    if left:
-        logger.info(f"Leaving {len(left)} sibling package(s) in place, they provide things "
-                    f"the build does not: {', '.join(sorted(left))}")
-    return direct | covered, left
+    reqs = requirements()
+    while True:
+        stranded = set()
+        for name, needs in reqs.items():
+            if name in replaced:
+                continue
+            for need in needs:
+                match = UNSATISFIABLE.match(need)
+                if match and match.group(1) in replaced:
+                    stranded.add(name)
+                    break
+        if not stranded:
+            return replaced
+        logger.info(f"Also removing {len(stranded)} package(s) pinned to an exact version "
+                    f"of something replaced: {', '.join(sorted(stranded))}")
+        replaced |= stranded
 
 
 def restate(caps, *, isa, downstream, satisfied, stale):
@@ -525,7 +512,7 @@ def restate(caps, *, isa, downstream, satisfied, stale):
     return kept
 
 
-def meta_spec(version, release, projects, *, replaced, downstream, requires, recommends):
+def meta_spec(version, release, projects, *, replaced, curated, requires, recommends):
     # Release is written out rather than %{?dist}: this runs in a different
     # container from the project builds, and the exact version-release pairing
     # below must match them to the letter.
@@ -540,12 +527,16 @@ def meta_spec(version, release, projects, *, replaced, downstream, requires, rec
     ]
     lines += [f"Requires: kde-canary-{p}%{{?_isa}} = {version}-{release}" for p in projects]
     lines.append("")
+    # Provided as well as obsoleted, so anything left in the image that asks
+    # for one of these by name still resolves. Epoch 999 beats every Fedora
+    # EVR, including the Epoch: 1 several Gear packages carry.
     for name in sorted(replaced):
         lines += [f"Provides: {name} = {REPLACED_EVR}",
                   f"Provides: {name}%{{?_isa}} = {REPLACED_EVR}",
                   f"Obsoletes: {name} < {REPLACED_EVR}"]
     lines.append("")
-    lines += [f"Obsoletes: {name} < {REPLACED_EVR}" for name in sorted(downstream)]
+    # Obsoleted without being provided: these are meant to be gone.
+    lines += [f"Obsoletes: {name} < {REPLACED_EVR}" for name in sorted(curated)]
     lines.append("")
     lines += [f"Requires: {c.replace('%', '%%')}" for c in sorted(requires)]
     lines += [f"Recommends: {c.replace('%', '%%')}" for c in sorted(recommends)]
@@ -553,7 +544,7 @@ def meta_spec(version, release, projects, *, replaced, downstream, requires, rec
         "",
         "%description",
         "Every project built from KDE git master by fedora-plasma-canary, obsoleting",
-        "the Fedora packages it replaces and Fedora's downstream Plasma configuration.",
+        "the Fedora packages whose files it replaces.",
         "",
         "%files",
         "",
@@ -630,46 +621,43 @@ def phase_meta():
     logger.info(f"Building kde-canary {version}-{release} over {len(specs)} project packages.")
 
     ours = provides_of(rpms)
-    sources = source_map()
-    downstream = {n for n in sources if any(p.fullmatch(n) for p in DOWNSTREAM_CONFIG)} - KEEP
-    found, left = find_replaced(ours, our_files, sources)
-    found -= KEEP
-    replaced = found - downstream
-    logger.info(f"The build replaces {len(replaced)} Fedora package(s), and "
-                f"{len(found & downstream)} downstream config package(s) overlap it.")
+    evr, owner = installed()
+    logger.info(f"The base image has {len(evr)} packages owning {len(owner)} files.")
 
-    # Harvested only now, from the packages actually replaced. The distro
-    # packages' own requirements are what no generator can see. What they and
-    # the siblings left behind provided tells which of those requirements went
-    # stale: a sibling left in place is usually tied to its replaced main
-    # package by an exact-version Requires, so pointing kde-canary at it would
-    # ask for a transaction that cannot exist.
-    names = sorted(replaced)
-    harvested = {kind: repoquery(kind, *names) if names else []
-                 for kind in ("--requires", "--recommends")}
-    from_replaced_sources = sorted(replaced | left)
-    harvested["--provides"] = (repoquery("--provides", *from_replaced_sources)
-                               if from_replaced_sources else [])
-    for name, lines in (("replaced.txt", names), ("downstream.txt", sorted(downstream)),
-                        ("left-siblings.txt", sorted(left)),
-                        ("harvest-requires.txt", harvested["--requires"]),
-                        ("harvest-recommends.txt", harvested["--recommends"])):
+    found = find_replaced(our_files, evr, owner) - KEEP
+    curated = {n for n in found if any(p.fullmatch(n) for p in DOWNSTREAM_CONFIG)
+               or any(p.fullmatch(n) for p in CURATED_REMOVALS)}
+    replaced = found - curated
+    logger.info(f"kde-canary replaces {len(replaced)} package(s) and removes "
+                f"{len(curated)} more outright.")
+
+    # Harvested from the packages actually being removed, straight out of the
+    # same rpmdb. These are the dependency edges that disappear with them:
+    # the dlopen'd plugins, the daemons reached over D-Bus, the weak deps
+    # Fedora hangs the desktop off. No generator can see them from the files.
+    names = sorted(found)
+    harvested = {kind: set(rpm_query("-q", kind, *names).splitlines()) if names else set()
+                 for kind in ("--requires", "--recommends", "--provides")}
+    for name, lines in (("replaced.txt", sorted(replaced)), ("removed.txt", sorted(curated)),
+                        ("harvest-requires.txt", sorted(harvested["--requires"])),
+                        ("harvest-recommends.txt", sorted(harvested["--recommends"]))):
         with open(os.path.join(META, name), "w") as f:
             f.write("\n".join(lines) + "\n")
 
     meta = replaced | {name + isa for name in replaced}
     satisfied = ours | meta | our_files
+    # What only the removed packages provided goes stale with them.
     stale = {VERSIONED.sub("", c).strip() for c in harvested["--provides"]} - satisfied
 
-    common = dict(isa=isa, downstream=downstream, satisfied=satisfied, stale=stale)
+    common = dict(isa=isa, downstream=curated, satisfied=satisfied, stale=stale)
     requires = restate(harvested["--requires"], **common)
-    recommends = restate(harvested["--recommends"] + read_list("fedora-rundeps.txt"), **common)
+    recommends = restate(harvested["--recommends"] | set(read_list("fedora-rundeps.txt")), **common)
     recommends = {c for c in recommends if c not in requires and c + isa not in requires}
-    logger.info(f"kde-canary: {len(replaced)} replaced, {len(downstream)} downstream obsoleted, "
-                f"{len(requires)} requires and {len(recommends)} recommends re-stated.")
+    logger.info(f"kde-canary: {len(requires)} requires and {len(recommends)} recommends "
+                f"re-stated from the packages it removes.")
 
     rpms.append(rpmbuild("kde-canary", meta_spec(
-        version, release, specs, replaced=replaced, downstream=downstream,
+        version, release, specs, replaced=replaced, curated=curated,
         requires=requires, recommends=recommends)))
 
     packages = sorted(os.path.basename(r) for r in rpms)
