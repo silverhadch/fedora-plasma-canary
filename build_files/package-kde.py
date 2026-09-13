@@ -106,12 +106,19 @@ PROTECTED = re.compile(
     r"|libdnf5.*|bash|coreutils|util-linux.*|shadow-utils|selinux-policy.*"
     r"|ostree|bootc|rpm-ostree|python3|python3-libs)$")
 
-# A requirement our Provides cannot satisfy. kde-canary provides every
-# replaced name at epoch 999, so >= and > are covered; an exact or upper-bound
-# requirement on a replaced package is not, and whatever carries it has to go
-# in the same transaction. This is what takes plasma-workspace-common along
-# with plasma-workspace: subpackages pin their siblings to an exact version.
-UNSATISFIABLE = re.compile(r"^(\S+?)(\(\w[\w-]*\))?\s*(?:=|<=|<)\s*\S+$")
+# One "name op version" inside a requirement, plain or nested in a rich
+# dependency. Rich dependencies have to be searched rather than matched whole:
+# a version constraint buried in (foo = 1.2-3 if bar) binds exactly as tightly
+# as a plain one, and reading only the plain form is what made kde-canary
+# require the distro version of a package it obsoletes.
+CONSTRAINT = re.compile(r"([^\s(),]+(?:\([^\s()]*\))?)\s*(=|<=|<|>=|>)\s*([^\s(),]+)")
+
+# kde-canary provides every replaced name at epoch 999, so >= and > resolve
+# against it. An exact or upper-bound constraint does not, and whatever
+# carries one has to leave in the same transaction. This is what takes
+# plasma-workspace-common along with plasma-workspace: subpackages pin their
+# siblings to an exact version.
+UNSATISFIABLE_OPS = ("=", "<=", "<")
 
 VERSIONED = re.compile(r"\s+(?:<=|>=|=|<|>)\s+\S+$")
 
@@ -396,6 +403,27 @@ def files_of(rpms):
     return files
 
 
+def bare(name, isa):
+    """A requirement's package name, without its %{?_isa} suffix."""
+    name = name.strip()
+    return name[:-len(isa)] if isa and name.endswith(isa) else name
+
+
+def blocked_by(requirement, replaced, isa):
+    """Whether this requirement pins something being replaced to a version
+    kde-canary's Provides cannot supply."""
+    return any(op in UNSATISFIABLE_OPS and bare(name, isa) in replaced
+               for name, op, _ in CONSTRAINT.findall(requirement))
+
+
+def unpin(requirement):
+    """Drop every version constraint, keeping the structure. Versions were
+    written against the Fedora builds being replaced, so inside a rich
+    dependency they are as wrong as they are in a plain one, and there is no
+    way to restate them."""
+    return CONSTRAINT.sub(r"\1", requirement).strip()
+
+
 def rpm_query(*args):
     """rpm against the rpmdb of the image this runs in."""
     return subprocess.run(["rpm", *args], capture_output=True, text=True,
@@ -461,16 +489,10 @@ def find_replaced(our_files, evr, owner):
         replaced |= curated
 
     reqs = requirements()
+    isa = rpm_eval("%{?_isa}")
     while True:
-        stranded = set()
-        for name, needs in reqs.items():
-            if name in replaced:
-                continue
-            for need in needs:
-                match = UNSATISFIABLE.match(need)
-                if match and match.group(1) in replaced:
-                    stranded.add(name)
-                    break
+        stranded = {name for name, needs in reqs.items() if name not in replaced
+                    and any(blocked_by(need, replaced, isa) for need in needs)}
         if not stranded:
             return replaced
         logger.info(f"Also removing {len(stranded)} package(s) pinned to an exact version "
@@ -491,16 +513,20 @@ def restate(caps, *, isa, downstream, satisfied, stale):
         if cap.startswith(("rpmlib(", "config(")):
             continue
         if cap.startswith("("):
-            # Rich dependency, kept verbatim unless it names downstream config
-            if set(re.findall(r"[^\s()]+", cap)) & downstream:
+            # A rich dependency keeps its structure, which cannot be restated
+            # any other way, but loses its version constraints along with the
+            # packages they were written against.
+            names = {bare(n, isa) for n, _, _ in CONSTRAINT.findall(cap)}
+            names |= {bare(t, isa) for t in re.findall(r"[^\s(),]+", cap)}
+            if names & downstream:
                 continue
-            kept.add(cap)
+            kept.add(unpin(cap))
             continue
         name = VERSIONED.sub("", cap).strip()
-        bare = name[:-len(isa)] if isa and name.endswith(isa) else name
-        if bare in downstream or any(p.fullmatch(bare) for p in DOWNSTREAM_CONFIG):
+        plain = bare(name, isa)
+        if plain in downstream or any(p.fullmatch(plain) for p in DOWNSTREAM_CONFIG):
             continue
-        if name in satisfied or bare in satisfied:
+        if name in satisfied or plain in satisfied:
             continue
         if name in stale:
             dropped.add(name)
