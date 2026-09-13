@@ -99,6 +99,17 @@ CURATED_REMOVALS = [re.compile(p) for p in (
     r"sddm-kcm",
 )]
 
+# Where to look for collisions with packages that are not installed. The
+# repo-side check cannot ask about every file the build ships, so it asks
+# about the ones that identify a project: its binaries, plugins, desktop
+# entries, services. Locale, documentation and icon paths are left out, they
+# are the bulk of the file count and never the only thing two packages share.
+PROBE_DIRS = ("/usr/bin/", "/usr/sbin/", "/usr/libexec/", "/etc/",
+              "/usr/lib64/qt6/plugins/", "/usr/lib64/qt6/qml/",
+              "/usr/share/applications/", "/usr/share/metainfo/",
+              "/usr/share/dbus-1/", "/usr/share/kservices6/",
+              "/usr/lib/systemd/", "/usr/share/wayland-sessions/")
+
 # Obsoleting any of these would take the image with it. A collision here is a
 # packaging bug in the build, never something to resolve by replacing them.
 PROTECTED = re.compile(
@@ -424,6 +435,77 @@ def unpin(requirement):
     return CONSTRAINT.sub(r"\1", requirement).strip()
 
 
+def chunks(items, size=200):
+    items = sorted(items)
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def probe_paths(our_files):
+    """The files worth asking the repo about."""
+    def wanted(path):
+        if path.startswith(PROBE_DIRS):
+            return True
+        # Top-level libraries, but not the trees underneath /usr/lib64
+        return path.startswith("/usr/lib64/") and "/" not in path[len("/usr/lib64/"):]
+    return sorted(p for p in our_files if wanted(p) and "," not in p)
+
+
+def repoquery(*args):
+    process = subprocess.run(["dnf5", "repoquery", "--quiet", *args],
+                             capture_output=True, text=True)
+    if process.returncode != 0:
+        raise RuntimeError(f"dnf5 repoquery failed ({process.returncode}): "
+                           f"{process.stderr.strip()}")
+    return process.stdout
+
+
+def repo_file_map(names):
+    """name -> the files each package ships, straight from the repo."""
+    files, current = {}, None
+    for chunk in chunks(names, 200):
+        for line in repoquery("--qf", "@@%{name}\n[%{filenames}\n]", *chunk).splitlines():
+            if line.startswith("@@"):
+                current = files.setdefault(line[2:], set())
+            elif current is not None and line.startswith("/"):
+                current.add(line)
+    return files
+
+
+def repo_conflicts(our_files):
+    """Packages in the repo whose files collide with the build's.
+
+    The installed scan cannot see these: plasma-firewall is not part of
+    Kinoite, so nothing in the base owns its files, and kde-canary then
+    recommended it by name and rpm refused the transaction. Asking the repo
+    catches a collision with anything installable, whether or not the base
+    happens to carry it, and the criterion is still only file overlap."""
+    probes = probe_paths(our_files)
+    logger.info(f"Asking the repo who else ships any of {len(probes)} identifying files...")
+    owners = set()
+    for chunk in chunks(probes, 200):
+        owners.update(n.strip() for n in
+                      repoquery("--qf", "%{name}\n", "--file=" + ",".join(chunk)).splitlines()
+                      if n.strip())
+    if not owners:
+        return set()
+
+    # Their subpackages collide too, each on its own files: the firewalld
+    # backend of plasma-firewall lives in a separate one.
+    sources = {}
+    for line in repoquery("--qf", "%{name} %{sourcerpm}\n").splitlines():
+        name, _, srpm = line.strip().partition(" ")
+        if srpm and srpm != "(none)":
+            sources[name] = srpm.rsplit("-", 2)[0]
+    srpms = {sources[n] for n in owners if n in sources}
+    family = owners | {n for n, src in sources.items() if src in srpms}
+
+    files = repo_file_map(sorted(family))
+    conflicting = {n for n in family if files.get(n, set()) & our_files}
+    logger.info(f"{len(conflicting)} package(s) in the repo ship files this build also "
+                f"ships, {len(conflicting - owners)} of them subpackages.")
+    return conflicting
+
+
 def rpm_query(*args):
     """rpm against the rpmdb of the image this runs in."""
     return subprocess.run(["rpm", *args], capture_output=True, text=True,
@@ -473,6 +555,7 @@ def find_replaced(our_files, evr, owner):
     call."""
     replaced = {owner[path] for path in our_files if path in owner}
     logger.info(f"{len(replaced)} installed package(s) own files this build ships.")
+    replaced |= repo_conflicts(our_files)
 
     fatal = {n for n in replaced if PROTECTED.fullmatch(n)}
     if fatal:
@@ -661,7 +744,10 @@ def phase_meta():
     # same rpmdb. These are the dependency edges that disappear with them:
     # the dlopen'd plugins, the daemons reached over D-Bus, the weak deps
     # Fedora hangs the desktop off. No generator can see them from the files.
-    names = sorted(found)
+    # Only the ones actually installed: a package the base does not carry
+    # brings no dependency edges into the image to inherit, and rpm cannot be
+    # asked about it anyway.
+    names = sorted(found & set(evr))
     harvested = {kind: set(rpm_query("-q", kind, *names).splitlines()) if names else set()
                  for kind in ("--requires", "--recommends", "--provides")}
     for name, lines in (("replaced.txt", sorted(replaced)), ("removed.txt", sorted(curated)),
