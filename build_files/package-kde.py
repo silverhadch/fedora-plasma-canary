@@ -110,6 +110,14 @@ PROBE_DIRS = ("/usr/bin/", "/usr/sbin/", "/usr/libexec/", "/etc/",
               "/usr/share/dbus-1/", "/usr/share/kservices6/",
               "/usr/lib/systemd/", "/usr/share/wayland-sessions/")
 
+# Rich dependency grammar, so the rest of the tokens are package names.
+RICH_OPERATORS = {"if", "else", "and", "or", "with", "without", "unless"}
+
+# One name inside a rich dependency, with its %{?_isa} suffix kept attached:
+# splitting on every parenthesis turns kf6-kwallet(x86-64) into a package
+# called x86-64, which is not installed anywhere and never will be.
+NAME_TOKEN = re.compile(r"[^\s(),]+(?:\([^\s(),]*\))?")
+
 # Obsoleting any of these would take the image with it. A collision here is a
 # packaging bug in the build, never something to resolve by replacing them.
 PROTECTED = re.compile(
@@ -451,12 +459,77 @@ def probe_paths(our_files):
 
 
 def repoquery(*args):
-    process = subprocess.run(["dnf5", "repoquery", "--quiet", *args],
-                             capture_output=True, text=True)
+    """A repo query with filelists loaded.
+
+    dnf5 does not download filelists metadata unless asked, and without it a
+    query about any path outside /usr/bin, /usr/sbin and /etc quietly matches
+    nothing at all. Paths are looked up as provides rather than with --file,
+    which is the form already known to take a comma-separated list."""
+    process = subprocess.run(
+        ["dnf5", "repoquery", "--quiet",
+         "--setopt=optional_metadata_types=filelists", *args],
+        capture_output=True, text=True)
     if process.returncode != 0:
         raise RuntimeError(f"dnf5 repoquery failed ({process.returncode}): "
                            f"{process.stderr.strip()}")
     return process.stdout
+
+
+# Ways to ask a repo who ships a path. Which one dnf5 honours is not worth
+# guessing at from here, so all of them are tried against paths whose answer is
+# already known and the first that works is used for the real queries.
+LOOKUP_FORMS = (
+    ("--whatprovides, comma separated",
+     lambda paths: ["--whatprovides=" + ",".join(paths)]),
+    ("--file, comma separated",
+     lambda paths: ["--file=" + ",".join(paths)]),
+    ("--file, repeated",
+     lambda paths: [f"--file={p}" for p in paths]),
+)
+
+
+def pick_lookup(owner):
+    """Whether a reverse path lookup actually returns anything.
+
+    Every previous repo-side check failed silently rather than loudly: the
+    query came back empty, which is indistinguishable from 'nothing
+    collides'. So ask it something with a known answer first, using paths the
+    installed rpmdb says are owned, and refuse to trust an empty result if
+    even those come back unowned."""
+    """The first lookup form that finds packages for paths known to be owned.
+
+    Every repo-side check so far failed silently rather than loudly: the query
+    came back empty, which reads exactly like 'nothing collides'. So each form
+    is asked something with a known answer, taken from the installed rpmdb,
+    before any of them is trusted."""
+    # Probe with paths outside /usr/bin, /usr/sbin and /etc. Those three are
+    # in the primary metadata and resolve even when filelists were never
+    # downloaded, so a probe made only of them would report success while
+    # every lookup that matters returned nothing.
+    primary = ("/usr/bin/", "/usr/sbin/", "/etc/")
+    known = [p for p in sorted(owner)
+             if p.startswith(PROBE_DIRS) and not p.startswith(primary)][:20]
+    if not known:
+        logger.info("The base image owns no indexable path outside /usr/bin, so the "
+                    "repo lookup cannot be verified; skipping the repo-side check.")
+        return None
+    for description, build_args in LOOKUP_FORMS:
+        try:
+            found = repoquery("--qf", "%{name}\n", *build_args(known))
+        except RuntimeError as e:
+            logger.warning(f"Lookup by {description} failed: {e}")
+            continue
+        if found.strip():
+            logger.info(f"Looking collisions up by {description}.")
+            return build_args
+        logger.warning(f"Lookup by {description} found nothing for {len(known)} paths "
+                       f"that are definitely owned, such as {known[0]}. Filelists "
+                       f"metadata may not be loaded.")
+    logger.error("No repo lookup form works here, so a collision with a package outside "
+                 "the base image cannot be found. kde-canary asks for nothing the base "
+                 "does not already carry, so nothing should pull one in; the install "
+                 "check remains the backstop.")
+    return None
 
 
 def repo_file_map(names):
@@ -471,20 +544,27 @@ def repo_file_map(names):
     return files
 
 
-def repo_conflicts(our_files):
+def repo_conflicts(our_files, owner):
     """Packages in the repo whose files collide with the build's.
 
     The installed scan cannot see these: plasma-firewall is not part of
     Kinoite, so nothing in the base owns its files, and kde-canary then
     recommended it by name and rpm refused the transaction. Asking the repo
     catches a collision with anything installable, whether or not the base
-    happens to carry it, and the criterion is still only file overlap."""
+    happens to carry it, and the criterion is still only file overlap.
+
+    Belt and braces: kde-canary no longer asks for anything the base image
+    does not already carry, so nothing should be pulled in to collide in the
+    first place. This stops one being installed later by hand."""
+    build_args = pick_lookup(owner)
+    if build_args is None:
+        return set()
     probes = probe_paths(our_files)
     logger.info(f"Asking the repo who else ships any of {len(probes)} identifying files...")
     owners = set()
     for chunk in chunks(probes, 200):
         owners.update(n.strip() for n in
-                      repoquery("--qf", "%{name}\n", "--file=" + ",".join(chunk)).splitlines()
+                      repoquery("--qf", "%{name}\n", *build_args(chunk)).splitlines()
                       if n.strip())
     if not owners:
         return set()
@@ -555,7 +635,10 @@ def find_replaced(our_files, evr, owner):
     call."""
     replaced = {owner[path] for path in our_files if path in owner}
     logger.info(f"{len(replaced)} installed package(s) own files this build ships.")
-    replaced |= repo_conflicts(our_files)
+    try:
+        replaced |= repo_conflicts(our_files, owner)
+    except RuntimeError as e:
+        logger.error(f"The repo-side collision check did not run: {e}")
 
     fatal = {n for n in replaced if PROTECTED.fullmatch(n)}
     if fatal:
@@ -583,15 +666,26 @@ def find_replaced(our_files, evr, owner):
         replaced |= stranded
 
 
-def restate(caps, *, isa, downstream, satisfied, stale):
+def rich_names(cap, isa):
+    """The package names a rich dependency mentions, without its operators."""
+    return {bare(t, isa) for t in NAME_TOKEN.findall(unpin(cap))} - RICH_OPERATORS
+
+
+def restate(caps, *, isa, downstream, satisfied, stale, present):
     """The requirements of the replaced packages that still need saying.
 
     Versions are dropped: they were written against the Fedora builds being
     replaced. A requirement the build already satisfies is redundant, one only
     the replaced packages satisfied is stale, and downstream config is out by
-    policy. What is left points outside the build, which is exactly the part
-    no generator can see."""
-    kept, dropped = set(), set()
+    policy.
+
+    What is left has to be something the image already has. These requirements
+    are inherited from packages the base image carries, so whatever they point
+    at is installed there too, and a name that is not is a package Fedora
+    builds but Kinoite does not ship. Asking for one of those by name is how
+    plasma-firewall and kate-krunner-plugin got dragged in to fight the build
+    over its own files."""
+    kept, stale_drop, absent = set(), set(), set()
     for cap in caps:
         if cap.startswith(("rpmlib(", "config(")):
             continue
@@ -599,9 +693,12 @@ def restate(caps, *, isa, downstream, satisfied, stale):
             # A rich dependency keeps its structure, which cannot be restated
             # any other way, but loses its version constraints along with the
             # packages they were written against.
-            names = {bare(n, isa) for n, _, _ in CONSTRAINT.findall(cap)}
-            names |= {bare(t, isa) for t in re.findall(r"[^\s(),]+", cap)}
+            names = rich_names(cap, isa)
             if names & downstream:
+                continue
+            missing = {n for n in names if not (n in present or n in satisfied)}
+            if missing:
+                absent |= missing
                 continue
             kept.add(unpin(cap))
             continue
@@ -612,12 +709,18 @@ def restate(caps, *, isa, downstream, satisfied, stale):
         if name in satisfied or plain in satisfied:
             continue
         if name in stale:
-            dropped.add(name)
+            stale_drop.add(name)
+            continue
+        if plain not in present:
+            absent.add(name)
             continue
         kept.add(name)
-    if dropped:
-        logger.info(f"Not re-stating {len(dropped)} requirement(s) that only the replaced "
-                    f"packages provided: {', '.join(sorted(dropped))}")
+    if stale_drop:
+        logger.info(f"Not re-stating {len(stale_drop)} requirement(s) that only the replaced "
+                    f"packages provided: {', '.join(sorted(stale_drop))}")
+    if absent:
+        logger.info(f"Not re-stating {len(absent)} requirement(s) on packages the base image "
+                    f"does not carry: {', '.join(sorted(absent))}")
     return kept
 
 
@@ -761,7 +864,11 @@ def phase_meta():
     # What only the removed packages provided goes stale with them.
     stale = {VERSIONED.sub("", c).strip() for c in harvested["--provides"]} - satisfied
 
-    common = dict(isa=isa, downstream=curated, satisfied=satisfied, stale=stale)
+    # A requirement resolves in the image only if the base image has it. File
+    # paths count as present when some installed package owns them.
+    present = set(evr) | set(owner)
+    common = dict(isa=isa, downstream=curated, satisfied=satisfied, stale=stale,
+                  present=present)
     requires = restate(harvested["--requires"], **common)
     recommends = restate(harvested["--recommends"] | set(read_list("fedora-rundeps.txt")), **common)
     recommends = {c for c in recommends if c not in requires and c + isa not in requires}
