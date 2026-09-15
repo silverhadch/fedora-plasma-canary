@@ -48,8 +48,25 @@ if os.path.exists(rust_cmake):
 # --- Build ---
 os.environ["CXXFLAGS"] = "-ffile-prefix-map=/builder/src/=/usr/src/debug/"
 
-args = ["kde-builder", "--refresh-build"] + KDE_BUILDER_TARGETS
+DESTDIR = os.environ.get("KDE_MASTER_INSTALL_DESTDIR", "/work/tree/install")
+
+# --clean-build since kde-builder deprecated --refresh-build for it, and this
+# runs against a fresh clone of kde-builder master on every build.
+args = ["kde-builder", "--clean-build"] + KDE_BUILDER_TARGETS
 logger.info(f"Running: {' '.join(args)}")
 process = subprocess.run(args=args)
 if process.returncode != 0:
     raise Exception(f"kde-builder failed ({process.returncode})")
+
+# kde-builder can exit 0 having built nothing whatsoever: when it cannot
+# resolve the project names, every target is quietly skipped and the run looks
+# like a success. Catch that here, where kde-builder's own output is still on
+# screen, rather than thirty minutes later in the packaging step.
+installed = sorted(os.listdir(DESTDIR)) if os.path.isdir(DESTDIR) else []
+if not installed:
+    raise Exception(
+        f"kde-builder exited 0 but installed nothing into {DESTDIR}. Either it "
+        f"resolved no projects, in which case its messages above say why, or the "
+        f"ninja hijack did not run."
+    )
+logger.info(f"{len(installed)} projects installed into {DESTDIR}.")

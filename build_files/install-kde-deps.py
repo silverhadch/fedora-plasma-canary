@@ -67,7 +67,22 @@ def get_all_build_targets(targets):
             part = line.split("Building ", 1)[1]
             module = part.split()[0].split("/")[-1]
             resolved.append(module)
-    return list(dict.fromkeys(resolved))
+    resolved = list(dict.fromkeys(resolved))
+    if not resolved:
+        # An empty build order is never a real answer, and it used to pass in
+        # silence: no build dependencies were installed, kde-builder then built
+        # nothing, and the run failed half an hour later in the packaging step
+        # with an empty tree, which says nothing about the cause. kde-builder's
+        # own output is the only thing that explains it, so print that.
+        logger.error(f"kde-builder resolved none of the {len(targets)} targets in "
+                     f"targets.txt (exit {result.returncode}).")
+        for stream, text in (("stdout", result.stdout), ("stderr", result.stderr)):
+            text = text.strip()
+            if text:
+                logger.error(f"kde-builder {stream}:\n{text[-4000:]}")
+        raise SystemExit("Refusing to continue with an empty build order.")
+    logger.info(f"kde-builder resolved {len(resolved)} projects to build.")
+    return resolved
 
 
 def fetch_deps_yaml(url):
