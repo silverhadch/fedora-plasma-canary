@@ -59,9 +59,24 @@ ccache --set-config=max_size=5G
 ccache --set-config=compression=true
 ccache -z
 
-log "Installing kde-builder..."
+# Cloned from upstream at build time, so a commit on kde-builder master reaches
+# this build with nothing to show for it in the repo. kde-builder-ref.txt is how
+# that gets pinned when upstream breaks; see the file for why it exists.
+REF="${KDE_BUILDER_REF:-}"
+if [ -z "$REF" ] && [ -f /ctx/kde-builder-ref.txt ]; then
+    REF=$(sed 's/#.*//' /ctx/kde-builder-ref.txt | tr -d '[:space:]')
+fi
+REF="${REF:-master}"
+
+log "Installing kde-builder (${REF})..."
 git clone https://invent.kde.org/sdk/kde-builder.git /usr/share/kde-builder
+git -C /usr/share/kde-builder checkout --quiet "$REF" \
+    || die "kde-builder has no ref '${REF}'. Fix build_files/kde-builder-ref.txt."
 ln -sf /usr/share/kde-builder/kde-builder /usr/bin/kde-builder
+
+COMMIT=$(git -C /usr/share/kde-builder rev-parse HEAD)
+log "kde-builder ${REF} is ${COMMIT}"
+printf '%s %s\n' "$REF" "$COMMIT" > /work/meta/kde-builder-commit.txt
 
 log "Installing KDE build dependencies..."
 python3 /ctx/install-kde-deps.py 2>&1 | tee -a "$LOG_DIR/deps.log" \

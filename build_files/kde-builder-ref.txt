@@ -1,0 +1,20 @@
+# Which kde-builder to build with.
+#
+# kde-builder is cloned from upstream at build time, so a commit on its master
+# lands here with nothing to show for it in this repo. That is usually what a
+# canary image wants, right up until upstream breaks: on 2026-09-15 kde-builder
+# master stopped resolving any project at all, reporting only
+#
+#   Cannot check kde-builder-format in repo-metadata, because
+#   repo-metadata-format.yaml is missing in repo-metadata
+#
+# and then exiting 0 with an empty build list.
+#
+# Put a commit or tag here to pin it and get building again while upstream is
+# broken. Back to master once it is fixed. The resolved commit is recorded in
+# meta/kde-builder-commit.txt of every build, so the last good one is
+# recoverable from a successful run's artifact.
+#
+# The KDE_BUILDER_REF environment variable, and the kde_builder_ref input of
+# the Build KDE Master workflow, both override this without a commit.
+master

@@ -80,7 +80,12 @@ def get_all_build_targets(targets):
             text = text.strip()
             if text:
                 logger.error(f"kde-builder {stream}:\n{text[-4000:]}")
-        raise SystemExit("Refusing to continue with an empty build order.")
+        raise SystemExit(
+            "Refusing to continue with an empty build order. If kde-builder is "
+            "reporting a problem with repo-metadata rather than with these targets, "
+            "it has broken upstream: pin a working commit in "
+            "build_files/kde-builder-ref.txt, taking the last good one from "
+            "meta/kde-builder-commit.txt in a successful build's artifact.")
     logger.info(f"kde-builder resolved {len(resolved)} projects to build.")
     return resolved
 

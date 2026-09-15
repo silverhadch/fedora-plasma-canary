@@ -9,6 +9,13 @@ on:
       - dev
   workflow_dispatch:
     inputs:
+      kde_builder_ref:
+        description: >-
+          Build with this kde-builder commit, tag or branch instead of the one
+          pinned in build_files/kde-builder-ref.txt. For testing whether an
+          upstream kde-builder breakage is fixed.
+        required: false
+        default: ''
       packages_from_run:
         description: >-
           Skip the KDE build and repackage the project RPMs of this earlier
@@ -145,6 +152,7 @@ jobs:
               --privileged \
               --env BUILD_DEADLINE="$(( $(date +%s) + LIMIT ))" \
               --env PACKAGE_RESERVE=1800 \
+              --env KDE_BUILDER_REF="${{ inputs.kde_builder_ref }}" \
               --volume "$(pwd)/build_files:/ctx:ro" \
               --volume "/home/runner/ccache:/ccache" \
               --volume "/tmp/kde-work:/work" \
