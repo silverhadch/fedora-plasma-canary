@@ -1,0 +1,21 @@
+# Installed by build.sh on top of Kinoite rawhide and the KDE master RPMs.
+#
+# Kinoite is already the desktop platform (firmware, fonts, codecs, printing,
+# input methods, presets), so this is only the development layer. Anything the
+# image lost compared to its Kinoite base shows up in compare-with-kinoite.sh.
+# Nothing here is installed with --skip-unavailable: a name that stops
+# resolving fails the build.
+
+# kde-builder and the toolchain it drives
+@development-tools
+git ninja-build rsync openssh-clients ccache cmake rpm-build jq
+python3-yaml python3-requests python3-pip python3-setproctitle ruby
+clang-devel clang-tools-extra git-clang-format
+dnf5-plugins
+
+# Editors, IDE, debugging
+neovim zsh gdb flatpak-builder
+kdevelop kdevelop-devel kdevelop-libs
+
+# Smartcards, pcscd.socket is enabled in build.sh
+pcscd

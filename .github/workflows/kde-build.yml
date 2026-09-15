@@ -8,14 +8,29 @@ on:
       - main
       - dev
   workflow_dispatch:
+    inputs:
+      packages_from_run:
+        description: >-
+          Skip the KDE build and repackage the project RPMs of this earlier
+          run ID instead (same branch, within the artifact retention). For
+          iterating on kde-canary without waiting hours for a build.
+        required: false
+        default: ''
 
 concurrency:
-  group: kde-build-${{ github.ref_name }}
+  # A repackaging run is minutes long and must not cancel a real build.
+  group: kde-build-${{ github.ref_name }}${{ inputs.packages_from_run && '-repackage' || '' }}
   cancel-in-progress: true
+
+env:
+  # Kinoite rawhide, mirrored daily. Also the default BASE_IMAGE in the
+  # Containerfile and the Justfile, keep in sync.
+  MIRROR_NAME: fedora-plasma-canary-kinoite
 
 jobs:
   build_kde:
     name: Build KDE from source
+    if: ${{ !inputs.packages_from_run }}
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     permissions:
@@ -58,35 +73,48 @@ jobs:
           mkdir -p /home/runner/ccache
           chmod 777 /home/runner/ccache
 
-      - name: Mirror rawhide base image with daily tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Mirror Kinoite rawhide
         run: |
+          set -euo pipefail
           mkdir -p /tmp/kde-work
           DATE=$(date +%Y%m%d)
-          TAG="rawhide-${DATE}"
-          MIRROR="ghcr.io/${{ github.repository_owner }}/fedora-plasma-canary-base"
+          MIRROR="ghcr.io/${{ github.repository_owner }}/${MIRROR_NAME}"
           MIRROR="${MIRROR,,}"
 
-          echo "${{ secrets.GITHUB_TOKEN }}" | sudo skopeo login ghcr.io \
-            -u ${{ github.actor }} --password-stdin
+          if ! echo "${{ secrets.GITHUB_TOKEN }}" | sudo skopeo login ghcr.io \
+                -u ${{ github.actor }} --password-stdin; then
+            echo "::error::Failed to log in to ghcr.io."
+            exit 1
+          fi
 
-          echo "Mirroring quay.io/fedora-ostree-desktops/base-atomic:rawhide -> ${MIRROR}:${TAG}"
-          sudo skopeo copy --all \
-            docker://quay.io/fedora-ostree-desktops/base-atomic:rawhide \
-            docker://${MIRROR}:${TAG}
+          # Kinoite rawhide is published in more than one place and any of them
+          # can go stale or lose its tag on a given day. The resolver inspects
+          # all of them plus the mirror's own :latest and returns whichever was
+          # built most recently, so the mirror only ever moves forward and a bad
+          # upstream day just reuses it.
+          SRC=$(sudo python3 .github/scripts/resolve-base.py --mirror "${MIRROR}:latest")
 
-          sudo skopeo copy --all \
-            docker://${MIRROR}:${TAG} \
-            docker://${MIRROR}:latest
+          if [ "${SRC}" = "${MIRROR}:latest" ]; then
+            echo "The mirror already holds the newest Kinoite rawhide."
+            PIN="${MIRROR}:latest"
+          else
+            # Single-arch copy: only amd64 is built, and Kinoite is big enough
+            # that copying every architecture daily eats into the build budget.
+            sudo skopeo copy --retry-times 3 \
+              "docker://${SRC}" "docker://${MIRROR}:rawhide-${DATE}"
+            sudo skopeo copy \
+              "docker://${MIRROR}:rawhide-${DATE}" "docker://${MIRROR}:latest"
+            echo "Mirrored ${SRC} -> ${MIRROR}:rawhide-${DATE}"
+            PIN="${MIRROR}:rawhide-${DATE}"
+          fi
 
-          DIGEST=$(sudo skopeo inspect docker://${MIRROR}:${TAG} --format '{{.Digest}}')
-          echo "BASE_IMAGE_TAG=${TAG}" >> ${GITHUB_ENV}
-          echo "MIRROR_IMAGE=${MIRROR}" >> ${GITHUB_ENV}
-          printf "rawhide=%s@%s\n" "${MIRROR}" "${DIGEST}" > /tmp/kde-work/base-image-digest.txt
-          echo "Pinned: $(cat /tmp/kde-work/base-image-digest.txt)"
+          DIGEST=$(sudo skopeo inspect --no-tags --format '{{.Digest}}' "docker://${PIN}")
+          echo "BASE_IMAGE=${MIRROR}@${DIGEST}" >> ${GITHUB_ENV}
+          printf 'rawhide=%s@%s\nsource=%s\n' "${MIRROR}" "${DIGEST}" "${SRC}" \
+            > /tmp/kde-work/base-image-digest.txt
+          echo "Pinned: $(head -1 /tmp/kde-work/base-image-digest.txt)"
 
-      - name: Build KDE in container
+      - name: Build and package KDE in container
         id: kde_build
         run: |
           set -uo pipefail
@@ -109,14 +137,18 @@ jobs:
 
           # timeout runs *under* sudo so it supervises podman directly and the
           # TERM actually reaches the container. Everything ccache has written
-          # to the bind mount up to that instant survives.
+          # to the bind mount up to that instant survives. Inside, kde-builder
+          # is stopped PACKAGE_RESERVE seconds before BUILD_DEADLINE so that
+          # turning the tree into RPMs always fits inside the same limit.
           sudo timeout --signal=TERM --kill-after=120 "${LIMIT}s" \
             podman run --rm \
               --privileged \
+              --env BUILD_DEADLINE="$(( $(date +%s) + LIMIT ))" \
+              --env PACKAGE_RESERVE=1800 \
               --volume "$(pwd)/build_files:/ctx:ro" \
               --volume "/home/runner/ccache:/ccache" \
               --volume "/tmp/kde-work:/work" \
-              ${MIRROR_IMAGE}:${BASE_IMAGE_TAG} \
+              "${BASE_IMAGE}" \
               bash /ctx/kde-build-container.sh
           rc=$?
 
@@ -153,36 +185,99 @@ jobs:
         with:
           name: kde-build-${{ github.ref_name }}
           path: |
-            /tmp/kde-work/kde-master.tar.zst
+            /tmp/kde-work/rpms/
+            /tmp/kde-work/meta/
             /tmp/kde-work/base-image-digest.txt
-            /tmp/kde-work/kde-runtime-deps.txt
-            /tmp/kde-work/kde-excluded-pkgs.txt
-          retention-days: 1
+          if-no-files-found: error
+          # Long enough to repackage a weekend's build on Monday
+          retention-days: 3
+          # RPM payloads are already zstd-compressed
+          compression-level: 0
 
   release:
-    name: Publish release
+    name: Package, check and publish release
     runs-on: ubuntu-24.04
     needs: build_kde
+    if: >-
+      ${{ !cancelled() && (needs.build_kde.result == 'success' ||
+          (needs.build_kde.result == 'skipped' && inputs.packages_from_run)) }}
     permissions:
+      actions: read
       contents: write
+      packages: read
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
       - name: Download build artifacts
         uses: actions/download-artifact@v8
         with:
           name: kde-build-${{ github.ref_name }}
           path: /tmp/kde-work/
+          run-id: ${{ inputs.packages_from_run || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload KDE tar to kde-nightly release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: kde-nightly-${{ github.ref_name }}
-          name: KDE Master Nightly (${{ github.ref_name }})
-          body: "KDE git master build for branch ${{ github.ref_name }} — updated daily. Do not use directly, consumed by the image build pipeline."
-          prerelease: true
-          make_latest: false
-          files: |
-            /tmp/kde-work/kde-master.tar.zst
-            /tmp/kde-work/base-image-digest.txt
-            /tmp/kde-work/kde-runtime-deps.txt
-            /tmp/kde-work/kde-excluded-pkgs.txt
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the kde-canary metapackage
+        run: |
+          set -euo pipefail
+          BASE=$(grep '^rawhide=' /tmp/kde-work/base-image-digest.txt | cut -d= -f2)
+          echo "BASE_IMAGE=${BASE}" >> "${GITHUB_ENV}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io \
+            -u ${{ github.actor }} --password-stdin
+
+          # On the base the image is built from, so dnf sees exactly the
+          # distro packages the image will have to swap out. This container
+          # gets rpm-build and is thrown away; the check below uses a fresh one.
+          sudo podman run --rm \
+            --volume "$(pwd)/build_files:/ctx:ro" \
+            --volume "/tmp/kde-work:/work" \
+            "${BASE}" \
+            bash -c 'dnf5 install -y rpm-build redhat-rpm-config && python3 /ctx/package-kde.py meta'
+
+      - name: Check the image transaction installs
+        run: |
+          set -euo pipefail
+          BASE="${BASE_IMAGE}"
+
+          # A fresh copy of the exact base the RPMs were built on, running the
+          # exact transaction build.sh will run. If it cannot install, stop
+          # here: the release keeps the last good RPMs and the image keeps
+          # building from them.
+          sudo podman run --rm \
+            --volume "$(pwd)/build_files:/ctx:ro" \
+            --volume "/tmp/kde-work/rpms:/rpms:ro" \
+            "${BASE}" \
+            bash /ctx/check-install.sh /rpms
+
+      - name: Publish RPMs to kde-nightly release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: kde-nightly-${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd /tmp/kde-work
+
+          # Recreated rather than updated: the set of assets changes whenever a
+          # project is added or dropped, and a leftover RPM from an older build
+          # has no business sitting next to the new ones. One asset per RPM, so
+          # no single file runs into the release asset size limit.
+          gh release delete "${TAG}" --repo "${{ github.repository }}" --yes --cleanup-tag || true
+          gh release create "${TAG}" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --prerelease \
+            --latest=false \
+            --title "KDE Master Nightly (${{ github.ref_name }})" \
+            --notes "KDE git master built as RPMs for branch ${{ github.ref_name }}, updated daily. Consumed by the image build pipeline, install kde-canary from here only if you know why." \
+            rpms/*.rpm rpms/manifest.txt meta/replaced.txt base-image-digest.txt

@@ -47,7 +47,6 @@ global:
   - kgamma
   - kwin-x11
   - wacomtablet
-  - packagekit-qt
   - plymouth-kcm
   - kaccounts-integration
   - kde-vdg-extras
