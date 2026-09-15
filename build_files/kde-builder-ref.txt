@@ -10,11 +10,16 @@
 #
 # and then exiting 0 with an empty build list.
 #
-# Put a commit or tag here to pin it and get building again while upstream is
-# broken. Back to master once it is fixed. The resolved commit is recorded in
-# meta/kde-builder-commit.txt of every build, so the last good one is
-# recoverable from a successful run's artifact.
+# Pinned to 01fba8a, the last commit before that check existed, verified to
+# resolve all 31 targets against the same base image. It is also the commit
+# that added --clean-build, which build-kde.py uses, so anything older needs
+# that changed back to --refresh-build.
+#
+# Back to master once upstream is fixed: run the workflow by hand with
+# kde_builder_ref set to master, and if it resolves projects, put master back
+# here. The resolved commit is recorded in meta/kde-builder-commit.txt of
+# every build, so the last good one is always recoverable from an artifact.
 #
 # The KDE_BUILDER_REF environment variable, and the kde_builder_ref input of
 # the Build KDE Master workflow, both override this without a commit.
-master
+01fba8a
