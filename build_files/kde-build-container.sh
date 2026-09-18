@@ -29,6 +29,18 @@ cat >> /etc/dnf/dnf.conf << 'EOF'
 excludepkgs=*.i686
 EOF
 
+# The base image carries whatever dnf cached when Kinoite was composed, and
+# rawhide moves every day. Stale repodata makes dnf ask the mirrors for files
+# from a compose that has since been rotated away: every mirror answers 404 on
+# the primary.xml.zck named in the cached repomd, and the repo ends up
+# unusable. Fedora's dnf.conf ships skip_if_unavailable=True, so that is not an
+# error, it is a repo that quietly is not there, and every --skip-unavailable
+# install after it drops packages without a word.
+log "Refreshing repository metadata..."
+dnf5 clean all
+dnf5 makecache --refresh || die "Could not refresh repository metadata. Every \
+package install after this would silently install nothing."
+
 # rpm-build, redhat-rpm-config and the generator packages are what
 # package-kde.py needs: %dist, %_isa, and the cmake()/python dependency
 # generators. readelf (binutils) finds Qt private API use, getcap (libcap)
