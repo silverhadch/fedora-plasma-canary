@@ -48,19 +48,37 @@ def run_kde_builder(args):
 
 
 def get_all_build_targets(targets):
-    """Every project kde-builder will build, in build order."""
+    """Every project kde-builder will build, in build order.
+
+    Asked with --query rather than --pretend. --pretend on kde-builder master
+    does not pretend: it clones and compiles for real, and dies on the first
+    project with
+
+      [Errno 2] No such file or directory: '/builder/src/extra-cmake-modules'
+
+    having printed one "Building ..." line. Parsing those lines then returned a
+    build order of one project, so one project's worth of build dependencies
+    was installed and karchive failed to configure six projects later for want
+    of bzip2-devel.
+
+    --query returns before the build lock is taken, cannot build anything, and
+    prints "project: value" once per project in dependency order. source-dir is
+    asked for because it is a pure path computation that touches neither the
+    network nor the build system.
+    """
     logger.info("Querying kde-builder for true build targets...")
     result = subprocess.run(
-        ["kde-builder", "--include-dependencies", "--no-stop-on-failure", "--pretend"] + targets,
+        ["kde-builder", "--include-dependencies", "--query", "source-dir"] + targets,
         capture_output=True,
         text=True,
     )
     resolved = []
     for line in result.stdout.splitlines():
-        if "Building " in line:
-            part = line.split("Building ", 1)[1]
-            module = part.split()[0].split("/")[-1]
-            resolved.append(module)
+        name, sep, value = line.partition(": ")
+        # Only "name: /absolute/path" lines are answers. kde-builder's progress
+        # and its dbus warning also carry a colon, and none of them are a path.
+        if sep and value.startswith("/") and name.strip():
+            resolved.append(name.strip().split("/")[-1])
     resolved = list(dict.fromkeys(resolved))
     # Every name in targets.txt was asked for by name, so every one of them has
     # to come back. If some do not, this is not a shorter build: it is that the
