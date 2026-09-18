@@ -47,6 +47,32 @@ def run_kde_builder(args):
     return process.stdout
 
 
+def resolved_groups(targets, projects):
+    """The groups those projects came from.
+
+    targets.txt names groups as well as projects: workspace is a group, and it
+    expands into plasma-workspace, kwin, plasma-desktop and the rest, so it
+    never appears as a project itself. Asking which group each project belongs
+    to is what tells a group apart from a name kde-builder ignored.
+
+    Only lines whose left-hand side is a project already resolved are read, so
+    kde-builder's progress output and its dbus warning, which also carry a
+    colon, cannot invent a group name.
+    """
+    known = set(projects)
+    result = subprocess.run(
+        ["kde-builder", "--include-dependencies", "--query", "group"] + targets,
+        capture_output=True,
+        text=True,
+    )
+    groups = set()
+    for line in result.stdout.splitlines():
+        name, sep, value = line.partition(": ")
+        if sep and name.strip() in known and value.strip():
+            groups.add(value.strip())
+    return groups
+
+
 def get_all_build_targets(targets):
     """Every project kde-builder will build, in build order.
 
@@ -80,23 +106,24 @@ def get_all_build_targets(targets):
         if sep and value.startswith("/") and name.strip():
             resolved.append(name.strip().split("/")[-1])
     resolved = list(dict.fromkeys(resolved))
-    # Every name in targets.txt was asked for by name, so every one of them has
-    # to come back. If some do not, this is not a shorter build: it is that the
-    # "Building " lines this parses are no longer kde-builder's whole answer,
-    # and the projects it missed will be built with none of their dependencies
-    # installed. karchive went unnoticed that way, being a dependency rather
-    # than a target and so absent from the list nothing was checking.
-    absent = [t for t in targets if t not in resolved]
+    # Every name in targets.txt was asked for by name, so each one has to have
+    # contributed something: either a project of that name, or, for a group like
+    # workspace, the projects it expands into. A name that contributed neither
+    # is a name kde-builder silently ignored, and everything it would have
+    # pulled in goes unbuilt and undeclared. That is how a build order of one
+    # project passed unnoticed and left karchive without its bzip2-devel.
+    groups = resolved_groups(targets, resolved)
+    absent = [t for t in targets if t not in resolved and t not in groups]
     if resolved and absent:
-        logger.error(f"kde-builder resolved {len(resolved)} projects, but {len(absent)} of "
-                     f"the {len(targets)} names in targets.txt are not among them: "
-                     f"{', '.join(absent)}")
+        logger.error(f"kde-builder resolved {len(resolved)} projects in "
+                     f"{len(groups)} group(s), but {len(absent)} of the {len(targets)} "
+                     f"names in targets.txt are neither: {', '.join(absent)}")
         logger.error(f"kde-builder stdout:\n{result.stdout[-4000:]}")
         raise SystemExit(
-            "The build order is missing projects that were asked for by name, so the "
-            "parse of kde-builder's --pretend output is wrong, most likely because its "
-            "output format changed. Fix get_all_build_targets() rather than building "
-            "with a dependency list that covers only part of the tree.")
+            "Names in targets.txt resolved to no project and no group. Either they are "
+            "misspelled, or the parse of kde-builder's --query output is wrong because "
+            "its format changed. Fix that rather than building with a dependency list "
+            "that covers only part of the tree.")
     if not resolved:
         # An empty build order is never a real answer, and it used to pass in
         # silence: no build dependencies were installed, kde-builder then built
