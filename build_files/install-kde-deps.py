@@ -62,6 +62,23 @@ def get_all_build_targets(targets):
             module = part.split()[0].split("/")[-1]
             resolved.append(module)
     resolved = list(dict.fromkeys(resolved))
+    # Every name in targets.txt was asked for by name, so every one of them has
+    # to come back. If some do not, this is not a shorter build: it is that the
+    # "Building " lines this parses are no longer kde-builder's whole answer,
+    # and the projects it missed will be built with none of their dependencies
+    # installed. karchive went unnoticed that way, being a dependency rather
+    # than a target and so absent from the list nothing was checking.
+    absent = [t for t in targets if t not in resolved]
+    if resolved and absent:
+        logger.error(f"kde-builder resolved {len(resolved)} projects, but {len(absent)} of "
+                     f"the {len(targets)} names in targets.txt are not among them: "
+                     f"{', '.join(absent)}")
+        logger.error(f"kde-builder stdout:\n{result.stdout[-4000:]}")
+        raise SystemExit(
+            "The build order is missing projects that were asked for by name, so the "
+            "parse of kde-builder's --pretend output is wrong, most likely because its "
+            "output format changed. Fix get_all_build_targets() rather than building "
+            "with a dependency list that covers only part of the tree.")
     if not resolved:
         # An empty build order is never a real answer, and it used to pass in
         # silence: no build dependencies were installed, kde-builder then built
@@ -134,17 +151,31 @@ def install(packages):
         raise Exception(f"dnf5 install failed ({process.returncode})")
 
 
+# A name no package will ever provide, asked for alongside the real ones. If
+# rpm does not report it as missing, it is not reporting anything as missing,
+# and an empty result means the check is broken rather than that everything is
+# installed. package-kde.py's pick_lookup() probes its repo query the same way,
+# for the same reason: a silent check reads exactly like a passing one.
+SENTINEL = "kde-canary-sentinel-no-package-provides-this"
+
+
 def not_installed(packages):
     """Which of those names nothing installed provides.
 
     Capability names work here as well as package names: rpm indexes
     cmake(Qt6Core) and pkgconfig(libzstd) the same way it indexes bzip2-devel.
     """
-    p = subprocess.run(["rpm", "-q", "--whatprovides", *packages],
+    p = subprocess.run(["rpm", "-q", "--whatprovides", SENTINEL, *packages],
                        capture_output=True, text=True)
-    return sorted({line.rsplit(" ", 1)[-1].strip()
-                   for line in (p.stdout + p.stderr).splitlines()
-                   if "no package provides" in line})
+    missing = {line.rsplit(" ", 1)[-1].strip()
+               for line in (p.stdout + p.stderr).splitlines()
+               if "no package provides" in line}
+    if SENTINEL not in missing:
+        raise SystemExit(
+            f"rpm did not report {SENTINEL} as missing, so this check cannot tell an "
+            f"installed package from an absent one and its answer means nothing. rpm "
+            f"exited {p.returncode}. Its output was:\n{(p.stdout + p.stderr)[:2000]}")
+    return sorted(missing - {SENTINEL})
 
 
 def ensure_builddeps(builddeps):
