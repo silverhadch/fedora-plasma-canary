@@ -162,7 +162,7 @@ jobs:
 
           if [ "${rc}" -eq 124 ] || [ "${rc}" -eq 137 ]; then
             echo "::warning::Build hit the $(( LIMIT / 60 ))m limit and was stopped. \
-          The warm ccache is still being saved — rerun to continue from it."
+          The warm ccache is still being saved, rerun to continue from it."
           fi
 
           exit "${rc}"

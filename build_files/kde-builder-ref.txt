@@ -1,25 +1,12 @@
-# Which kde-builder to build with.
+# Which kde-builder to build with: a commit, tag or branch, or master to
+# track upstream. It is cloned at build time, so an upstream commit reaches
+# this build with nothing to show for it in this repo. Pin one here when
+# upstream breaks.
 #
-# kde-builder is cloned from upstream at build time, so a commit on its master
-# lands here with nothing to show for it in this repo. That is usually what a
-# canary image wants, right up until upstream breaks: on 2026-09-15 kde-builder
-# master stopped resolving any project at all, reporting only
+# Anything older than 01fba8a needs build-kde.py changed back to
+# --refresh-build, which --clean-build replaced.
 #
-#   Cannot check kde-builder-format in repo-metadata, because
-#   repo-metadata-format.yaml is missing in repo-metadata
-#
-# and then exiting 0 with an empty build list.
-#
-# Pinned to 01fba8a, the last commit before that check existed, verified to
-# resolve all 31 targets against the same base image. It is also the commit
-# that added --clean-build, which build-kde.py uses, so anything older needs
-# that changed back to --refresh-build.
-#
-# Back to master once upstream is fixed: run the workflow by hand with
-# kde_builder_ref set to master, and if it resolves projects, put master back
-# here. The resolved commit is recorded in meta/kde-builder-commit.txt of
-# every build, so the last good one is always recoverable from an artifact.
-#
-# The KDE_BUILDER_REF environment variable, and the kde_builder_ref input of
-# the Build KDE Master workflow, both override this without a commit.
+# Every build records the commit it resolved in meta/kde-builder-commit.txt,
+# so the last good one is recoverable from an artifact. KDE_BUILDER_REF and
+# the kde_builder_ref workflow input override this file.
 master

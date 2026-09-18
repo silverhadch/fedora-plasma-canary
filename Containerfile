@@ -12,8 +12,6 @@ RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     /ctx/build.sh && \
     ostree container commit
 
-### FIX VAR/RUN SYMLINK
 RUN rm -rf /var/run && ln -s /run /var/run
 
-### LINTING
 RUN bootc container lint

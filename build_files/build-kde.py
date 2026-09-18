@@ -29,23 +29,20 @@ def run_kde_builder(args):
     return process.stdout
 
 
-# --- ccache ---
 os.environ["CCACHE_DIR"] = "/ccache"
 
-# --- Setup config ---
 config_dir = "/root/.config"
 os.makedirs(config_dir, exist_ok=True)
 shutil.copy("/ctx/kde-builder.yaml", f"{config_dir}/kde-builder.yaml")
 
 run_kde_builder(["--metadata-only"])
 
-# --- TODO: Hotfix — remove Rust CMake file that conflicts with KDE's Rust builds ---
+# TODO: hotfix. Qt6's FindRust.cmake conflicts with KDE's own Rust builds.
 subprocess.run(["dnf5", "install", "-y", "qt6-qtwebengine-devel"])
 rust_cmake = "/usr/lib64/cmake/Qt6/FindRust.cmake"
 if os.path.exists(rust_cmake):
     os.remove(rust_cmake)
 
-# --- Build ---
 os.environ["CXXFLAGS"] = "-ffile-prefix-map=/builder/src/=/usr/src/debug/"
 
 DESTDIR = os.environ.get("KDE_MASTER_INSTALL_DESTDIR", "/work/tree/install")

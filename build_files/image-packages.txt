@@ -14,7 +14,7 @@ clang-devel clang-tools-extra git-clang-format
 dnf5-plugins
 
 # Editors, IDE, debugging
-neovim zsh gdb flatpak-builder
+helix zsh gdb flatpak-builder
 kdevelop kdevelop-devel kdevelop-libs
 
 # Smartcards, pcscd.socket is enabled in build.sh

@@ -489,13 +489,6 @@ LOOKUP_FORMS = (
 
 
 def pick_lookup(owner):
-    """Whether a reverse path lookup actually returns anything.
-
-    Every previous repo-side check failed silently rather than loudly: the
-    query came back empty, which is indistinguishable from 'nothing
-    collides'. So ask it something with a known answer first, using paths the
-    installed rpmdb says are owned, and refuse to trust an empty result if
-    even those come back unowned."""
     """The first lookup form that finds packages for paths known to be owned.
 
     Every repo-side check so far failed silently rather than loudly: the query

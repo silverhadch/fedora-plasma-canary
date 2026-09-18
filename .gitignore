@@ -3,3 +3,5 @@ _build_*
 output
 _build-*/**
 build_files/rpms/
+build_files/__pycache__/
+.github/scripts/__pycache__/

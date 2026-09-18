@@ -5,18 +5,12 @@
 
 Runs once in kde-build-container.sh, before kde-builder. That is all it does.
 
-It used to also rip the distro copy of every project out of the container, by
-a name guessed from the kde-builder module. That is what deleted the library
-under qmobipocket-devel's CMake config and stopped a build 56 projects in, and
-what removed the Qt4 'attica' because a module happens to share its name.
-
-None of it was needed. The container and the image start from the same pinned
-Kinoite, so a library the build links against here is present there too, and
-the RPMs are cut from the per-project DESTDIR trees rather than from this
-container's /usr, so nothing else installed here can reach the image.
-kde-builder installs each project into /usr in dependency order, so by the
-time a project is compiled its dependencies are already the fresh ones. The
-distro copies underneath are overwritten, not linked against.
+It does not remove the distro copy of each project, and must not start doing
+so again: the container and the image come from the same pinned Kinoite, the
+RPMs are cut from the per-project DESTDIR trees rather than this container's
+/usr, and kde-builder overwrites its dependencies in build order anyway.
+Guessing those package names from module names deleted qmobipocket's library
+and the Qt4 attica in earlier builds.
 """
 
 import argparse
