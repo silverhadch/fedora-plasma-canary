@@ -22,4 +22,4 @@
 #
 # The KDE_BUILDER_REF environment variable, and the kde_builder_ref input of
 # the Build KDE Master workflow, both override this without a commit.
-01fba8a
+master
