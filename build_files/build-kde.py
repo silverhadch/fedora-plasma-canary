@@ -49,7 +49,17 @@ DESTDIR = os.environ.get("KDE_MASTER_INSTALL_DESTDIR", "/work/tree/install")
 
 # --clean-build since kde-builder deprecated --refresh-build for it, and this
 # runs against a fresh clone of kde-builder master on every build.
-args = ["kde-builder", "--clean-build"] + KDE_BUILDER_TARGETS
+#
+# --no-async works around kde-builder master crashing in its async build path,
+# where the source directory arrives empty over IPC and recording last-build-rev
+# dies on git rev-parse with cwd='':
+#
+#   FileNotFoundError: [Errno 2] No such file or directory: ''
+#
+# Reported upstream; Andrew Shark suggested --no-async until it is fixed. Drop
+# the flag once it is, since serialising updates against builds costs time this
+# build does not have to spare.
+args = ["kde-builder", "--clean-build", "--no-async"] + KDE_BUILDER_TARGETS
 logger.info(f"Running: {' '.join(args)}")
 process = subprocess.run(args=args)
 if process.returncode != 0:
