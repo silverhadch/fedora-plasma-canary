@@ -94,11 +94,23 @@ def collect_deps(data, build_modules):
     build_modules = set(build_modules)
     builddeps = set()
     rundeps = set()
+    matched = set()
     for name, pkg in data.items():
         if name not in build_modules:
             continue
+        matched.add(name)
         builddeps.update(pkg.get("builddeps") or [])
         rundeps.update(pkg.get("rundeps") or [])
+    # A project with no entry contributes no build dependencies at all and will
+    # fail to configure if it needs anything the rest of the order did not
+    # already pull in. That is a gap in repo-metadata, so name them: the fix is
+    # an entry upstream, not another package added by hand here.
+    missing_entries = sorted(build_modules - matched)
+    logger.info(f"{len(matched)} of {len(build_modules)} projects have a fedora.yaml entry.")
+    if missing_entries:
+        logger.warning(f"{len(missing_entries)} project(s) have no entry in fedora.yaml, so "
+                       f"none of their build dependencies are installed: "
+                       f"{', '.join(missing_entries)}")
     return builddeps, rundeps
 
 
@@ -120,6 +132,55 @@ def install(packages):
     )
     if process.returncode != 0:
         raise Exception(f"dnf5 install failed ({process.returncode})")
+
+
+def not_installed(packages):
+    """Which of those names nothing installed provides.
+
+    Capability names work here as well as package names: rpm indexes
+    cmake(Qt6Core) and pkgconfig(libzstd) the same way it indexes bzip2-devel.
+    """
+    p = subprocess.run(["rpm", "-q", "--whatprovides", *packages],
+                       capture_output=True, text=True)
+    return sorted({line.rsplit(" ", 1)[-1].strip()
+                   for line in (p.stdout + p.stderr).splitlines()
+                   if "no package provides" in line})
+
+
+def ensure_builddeps(builddeps):
+    """Install whatever the lenient pass dropped, or stop the build here.
+
+    install() passes --skip-broken and --skip-unavailable so one bad name
+    cannot keep the build from starting at all. The cost is silence.
+    bzip2-devel is in the fedora.yaml builddeps for karchive, it went into the
+    same 700-package transaction as everything else, it did not get installed,
+    and nothing said so: the build found out seven projects later, as
+    "Could NOT find BZip2" in a cmake log.
+
+    Asking again for only the missing names, without the skip flags, either
+    installs them or makes dnf5 say why it cannot. --skip-broken prunes
+    whatever it cannot fit into one large transaction, which is not the same
+    thing as a package being unavailable, so the retry usually succeeds.
+    """
+    missing = not_installed(sorted(builddeps))
+    if not missing:
+        logger.info(f"All {len(builddeps)} build dependencies are installed.")
+        return
+
+    logger.warning(f"dnf5 skipped {len(missing)} build dependency(ies) silently: "
+                   f"{', '.join(missing)}")
+    logger.warning("Retrying them on their own, without --skip-broken.")
+    subprocess.run(["dnf5", "install", "-y", "--allowerasing"] + missing)
+
+    still = not_installed(missing)
+    if still:
+        raise SystemExit(
+            f"{len(still)} build dependency(ies) could not be installed: "
+            f"{', '.join(still)}. dnf5's reason is above. Every project needing one "
+            f"would fail to configure, so this stops here rather than hours into the "
+            f"build. If the name is simply gone from Fedora, that is a fedora.yaml "
+            f"entry to fix in repo-metadata.")
+    logger.info(f"The retry installed all {len(missing)}.")
 
 
 def main():
@@ -146,6 +207,7 @@ def main():
     write_list("fedora-rundeps.txt", sorted(rundeps))
 
     install(builddeps | rundeps)
+    ensure_builddeps(builddeps)
 
 
 if __name__ == "__main__":
